@@ -1,3 +1,4 @@
+# runner.py
 import random
 import logging
 from typing import Set, Optional
@@ -104,7 +105,12 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             adapter.cancel_orders_by_ids(to_cancel)
             logger.info(f"{adapter.exchange_name} | removed {len(to_cancel)} stale | kept {len(new_order_ids)}")
     except Exception as e:
-        logger.warning(f"{adapter.exchange_name} | cleanup error: {e}")
+        # In dry_run mode, fetch_open_orders should return empty list, so this shouldn't happen
+        # But if it does, log it as debug since it's expected behavior
+        if adapter.dry_run:
+            logger.debug(f"{adapter.exchange_name} | cleanup skipped (dry_run mode)")
+        else:
+            logger.warning(f"{adapter.exchange_name} | cleanup error: {e}")
 
     # === 8. Final log ===
     logger.info(

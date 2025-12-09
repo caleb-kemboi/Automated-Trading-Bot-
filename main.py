@@ -1,5 +1,13 @@
 # main.py
-import os, time, random, signal, logging
+import os
+import time
+import random
+import signal
+import logging
+
+from dotenv import load_dotenv
+load_dotenv()  # load .env into environment variables
+
 from config import EXCHANGES, SETTINGS
 from runner import run_once
 from adapters.ccxt_adapter import CCXTAdapter
@@ -15,9 +23,17 @@ logging.basicConfig(
 logger = logging.getLogger("oho_bot")
 
 RUNNING = True
-def stop(*_): global RUNNING; RUNNING = False; logger.info("Shutting down...")
+
+
+def stop(*_):
+    global RUNNING
+    RUNNING = False
+    logger.info("Shutting down...")
+
+
 signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGTERM, stop)
+
 
 def build_adapter(cfg):
     adapters = {
@@ -30,16 +46,28 @@ def build_adapter(cfg):
     }
     return adapters[cfg.id](cfg)
 
+
 def main():
     adapters = []
     for cfg in EXCHANGES:
-        if not cfg.enabled: continue
+        if not cfg.enabled:
+            continue
         try:
+            logger.debug(f"Initializing {cfg.id} adapter...")
             ad = build_adapter(cfg)
             ad.connect()
             adapters.append(ad)
         except Exception as e:
-            logger.error(f"Failed {cfg.id}: {e}")
+            # Log at appropriate level: debug in dry_run (expected), warning otherwise
+            error_msg = str(e)
+            if len(error_msg) > 200:
+                error_msg = error_msg[:200] + "..."
+            if cfg.dry_run:
+                # In dry_run, log at INFO for visibility, but indicate it's expected
+                logger.info(f"Failed to connect {cfg.id}: {error_msg} (skipping - dry_run mode)")
+            else:
+                logger.warning(f"Failed to connect {cfg.id}: {error_msg} (skipping this exchange)")
+            logger.debug(f"Full error for {cfg.id}:", exc_info=True)
 
     prev_ids = {}
     while RUNNING:
@@ -53,6 +81,7 @@ def main():
         time.sleep(max(0.1, sleep_time - (time.time() - start)))
 
     logger.info("Bot stopped cleanly.")
+
 
 if __name__ == "__main__":
     main()

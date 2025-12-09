@@ -1,6 +1,7 @@
 # config.py
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional, List
+
 
 @dataclass
 class ExchangeConfig:
@@ -15,6 +16,7 @@ class ExchangeConfig:
     hostname_env: str = ""
     symbol_override: Optional[str] = None
 
+
 @dataclass
 class BotSettings:
     reference_multiplier: float = 0.000000011
@@ -28,12 +30,55 @@ class BotSettings:
     min_spread_bps: float = 5.0
     maker_guard_ticks: int = 2
 
+
 SETTINGS = BotSettings()
 
-EXCHANGES = [
-    ExchangeConfig("bitmart",   "OHO/USDT", "BTC/USDT", True,  False, "BITMART_KEY", "BITMART_SECRET", "BITMART_UID", "BITMART_HOSTNAME"),
-    ExchangeConfig("p2b",       "OHO/USDT",  "BTC/USDT", True, False,  "P2B_KEY",     "P2B_SECRET"),
-    ExchangeConfig("dextrade",  "OHOUSDT",  "BTCUSDT",  True, False,  "DEXTRADE_KEY", "DEXTRADE_SECRET"),
-    ExchangeConfig("biconomy",  "OHO_USDT", "BTC_USDT", True, False,  "BICONOMY_KEY", "BICONOMY_SECRET"),
-    ExchangeConfig("tapbit",    "OHO/USDT", "BTC/USDT", True, False,  "TAPBIT_KEY",  "TAPBIT_SECRET"),
+EXCHANGES: List[ExchangeConfig] = [
+    ExchangeConfig(
+        id="bitmart",
+        symbol="OHO/USDT",
+        btc_symbol="BTC/USDT",
+        enabled=True,
+        dry_run=True,
+        api_key_env="BITMART_KEY",
+        secret_env="BITMART_SECRET",
+        uid_env="BITMART_UID",
+        hostname_env="BITMART_HOSTNAME"
+    ),
+    ExchangeConfig(
+        id="p2b",
+        symbol="OHO/USDT",
+        btc_symbol="BTC/USDT",
+            enabled=True,
+        dry_run=True,
+        api_key_env="P2B_KEY",
+        secret_env="P2B_SECRET"
+    ),
+    ExchangeConfig(
+        id="dextrade",
+        symbol="OHOUSDT",
+        btc_symbol="BTCUSDT",
+        enabled=True,
+        dry_run=True,
+        api_key_env="DEXTRADE_KEY",
+        secret_env="DEXTRADE_SECRET"
+    ),
+    ExchangeConfig(
+        id="biconomy",
+        symbol="OHO_USDT",
+        btc_symbol="BTC_USDT",
+        enabled=True,
+        dry_run=True,
+        api_key_env="BICONOMY_KEY",
+        secret_env="BICONOMY_SECRET"
+    ),
+    ExchangeConfig(
+        id="tapbit",
+        symbol="OHO/USDT",
+        btc_symbol="BTC/USDT",
+        enabled=True,
+        dry_run=True,
+        api_key_env="TAPBIT_KEY",
+        secret_env="TAPBIT_SECRET"
+    ),
 ]
