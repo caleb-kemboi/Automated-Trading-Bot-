@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 class CCXTAdapter(BaseAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
+
         init_args = {
             'apiKey': os.getenv(cfg.api_key_env, ""),
             'secret': os.getenv(cfg.secret_env, ""),
@@ -18,18 +19,19 @@ class CCXTAdapter(BaseAdapter):
             'timeout': 30000,
         }
 
-        # BitMart: UID required
-        if cfg.uid_env:
+        # BitMart UID
+        if getattr(cfg, "uid_env", None):
             uid = os.getenv(cfg.uid_env, "")
             if uid:
                 init_args['uid'] = uid
 
-        # BitMart: Correct hostname (critical!)
-        if cfg.hostname_env:
+        # BitMart custom hostname
+        if getattr(cfg, "hostname_env", None):
             hostname = os.getenv(cfg.hostname_env)
             if hostname:
-                init_args['hostname'] = hostname  # e.g. "api-cloud.bitmart.com"
+                init_args['hostname'] = hostname
 
+        # Create exchange client
         self.client = getattr(ccxt, cfg.id)(init_args)
         self._markets_loaded = False
 
@@ -44,40 +46,33 @@ class CCXTAdapter(BaseAdapter):
             logger.info(f"Connected {self.exchange_name} — {self.symbol}")
 
         except Exception as e:
-            # BitMart commonly fails load_markets() due to private endpoint auth requirements
-            if "bitmart" in str(self.exchange_name).lower() or "401" in str(e) or "403" in str(e):
-                logger.warning(f"{self.exchange_name}: load_markets failed (likely auth issue) — using limited mode")
+            # BitMart famously breaks load_markets()
+            if "bitmart" in self.exchange_name.lower() or "401" in str(e) or "403" in str(e):
+                logger.warning(f"{self.exchange_name}: load_markets failed — limited mode")
                 self._markets_loaded = False
 
-                # Try verifying symbol using public ticker
                 try:
                     self.client.fetch_ticker(self.symbol)
                     logger.info(f"Connected {self.exchange_name} — {self.symbol} (limited mode)")
                 except Exception:
-                    # BitMart frequently rejects ticker for new listings → skip failure
                     if self.exchange_name.lower() == "bitmart":
-                        logger.warning(
-                            f"{self.exchange_name}: ticker check skipped — BitMart often blocks public ticker for new tokens"
-                        )
-                        logger.info(f"Connected {self.exchange_name} — {self.symbol} (forced limited mode)")
+                        logger.info(f"{self.exchange_name}: forced limited mode")
                     else:
                         raise RuntimeError(f"Cannot verify symbol {self.symbol} on {self.exchange_name}")
             else:
                 raise
 
-    def fetch_btc_last(self) -> float:
+    def fetch_btc_last(self):
         try:
             return float(self.client.fetch_ticker(self.btc_symbol)['last'])
-        except Exception as e:
-            logger.error(f"{self.exchange_name}: Failed to fetch BTC price: {e}")
-            return 92000.0  # fallback
+        except:
+            return 92000.0
 
     def fetch_best_quotes(self):
         try:
             t = self.client.fetch_ticker(self.symbol)
             return t.get('bid'), t.get('ask')
-        except Exception as e:
-            logger.error(f"{self.exchange_name}: Failed to fetch quotes: {e}")
+        except:
             return None, None
 
     def fetch_open_orders(self):
@@ -91,14 +86,13 @@ class CCXTAdapter(BaseAdapter):
     def cancel_orders_by_ids(self, ids):
         if self.dry_run or not ids:
             return
-        try:
-            self.client.cancel_orders(list(ids), self.symbol)
-        except:
-            for oid in ids:
-                try:
-                    self.client.cancel_order(oid, self.symbol)
-                except:
-                    pass
+
+        # Cancel one by one (safe for BitMart & P2B)
+        for oid in ids:
+            try:
+                self.client.cancel_order(str(oid), self.symbol)
+            except:
+                pass
 
     def create_limit(self, side, price, amount):
         price = self.price_to_precision(price)
@@ -109,7 +103,9 @@ class CCXTAdapter(BaseAdapter):
             return "dry"
 
         params = {"postOnly": True}
-        if self.exchange_name == "bitmart":
+
+        # BitMart: must use timeInForce=PO
+        if self.exchange_name.lower() == "bitmart":
             params["timeInForce"] = "PO"
 
         try:
@@ -127,12 +123,12 @@ class CCXTAdapter(BaseAdapter):
     def amount_to_precision(self, a):
         if self._markets_loaded:
             return float(self.client.amount_to_precision(self.symbol, a))
-        return int(round(float(a)))
+        return float(round(float(a), 8))
 
     def get_limits(self):
         if self._markets_loaded:
             return self.client.markets[self.symbol]['limits']
-        return {"min_amount": 1000, "min_cost": 1.0}
+        return {"min_amount": 1.0, "min_cost": 1.0}
 
     def get_steps(self):
         if self._markets_loaded:

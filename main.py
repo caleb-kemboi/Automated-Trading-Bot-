@@ -6,7 +6,7 @@ import signal
 import logging
 
 from dotenv import load_dotenv
-load_dotenv()  # load .env into environment variables
+load_dotenv()
 
 from config import EXCHANGES, SETTINGS
 from runner import run_once
@@ -49,34 +49,45 @@ def build_adapter(cfg):
 
 def main():
     adapters = []
+
     for cfg in EXCHANGES:
         if not cfg.enabled:
             continue
+
+        logger.debug(f"Initializing {cfg.id} adapter...")
+
         try:
-            logger.debug(f"Initializing {cfg.id} adapter...")
             ad = build_adapter(cfg)
-            ad.connect()
-            adapters.append(ad)
+            ad.connect()          # try connecting first
+            adapters.append(ad)   # add on success
+
         except Exception as e:
-            # Log at appropriate level: debug in dry_run (expected), warning otherwise
             error_msg = str(e)
             if len(error_msg) > 200:
                 error_msg = error_msg[:200] + "..."
+
             if cfg.dry_run:
-                # In dry_run, log at INFO for visibility, but indicate it's expected
-                logger.info(f"Failed to connect {cfg.id}: {error_msg} (skipping - dry_run mode)")
+                # In dry mode → still add adapter
+                logger.info(f"{cfg.id}: connect failed ({error_msg}) — continuing in dry-run mode")
+                adapters.append(ad)
+                continue
             else:
-                logger.warning(f"Failed to connect {cfg.id}: {error_msg} (skipping this exchange)")
-            logger.debug(f"Full error for {cfg.id}:", exc_info=True)
+                logger.warning(f"{cfg.id}: connect failed ({error_msg}) — skipping this exchange")
+                logger.debug(f"Full error:", exc_info=True)
+                continue
 
     prev_ids = {}
+
     while RUNNING:
         start = time.time()
+
         for ad in adapters:
+            key = ad.exchange_name   # safer unique identifier
             try:
-                prev_ids[ad.exchange_name] = run_once(ad, prev_ids.get(ad.exchange_name))
-            except Exception as e:
+                prev_ids[key] = run_once(ad, prev_ids.get(key))
+            except Exception:
                 logger.exception(f"Error on {ad.exchange_name}")
+
         sleep_time = random.uniform(SETTINGS.interval_min_s, SETTINGS.interval_max_s)
         time.sleep(max(0.1, sleep_time - (time.time() - start)))
 

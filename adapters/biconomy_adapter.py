@@ -6,33 +6,52 @@ import requests
 import logging
 from typing import Optional
 from .base import BaseAdapter
-from config import SETTINGS
 
 logger = logging.getLogger(__name__)
+
 BASE = "https://api.biconomy.com"
 
 
 class BiconomyAdapter(BaseAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.key = os.getenv("BICONOMY_KEY", "") or getattr(self.cfg, "api_key_env", "")
-        self.secret = os.getenv("BICONOMY_SECRET", "") or getattr(self.cfg, "secret_env", "")
-        self.session = requests.Session()
-        # keep original header setup (safe even if key is empty)
-        if self.key:
-            self.session.headers.update({"X-BB-APIKEY": self.key, "X-SITE-ID": "127"})
-        else:
-            # still set site id for public calls if required
-            self.session.headers.update({"X-SITE-ID": "127"})
 
-    def _sign(self, params):
+        self.key = os.getenv("BICONOMY_KEY", "") or getattr(cfg, "api_key_env", "")
+        self.secret = os.getenv("BICONOMY_SECRET", "") or getattr(cfg, "secret_env", "")
+
+        self.session = requests.Session()
+
+        if self.key:
+            self.session.headers.update({
+                "X-BB-APIKEY": self.key,
+                "Content-Type": "application/x-www-form-urlencoded",  # Changed from application/json
+                "X-SITE-ID": "127"
+            })
+
+    def _sign(self, params: dict) -> dict:
+        """Sign parameters using MD5 with secret key"""
         if not self.secret:
-            logger.warning("Biconomy: No SECRET set — skipping signature (public calls only)")
+            logger.warning("Biconomy: SECRET missing — cannot sign private requests.")
             return params
+
         params = params.copy()
-        params["timestamp"] = str(int(time.time() * 1000))
-        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        params["signature"] = hashlib.md5((query + self.secret).encode()).hexdigest().lower()
+
+        # Add api_key to params
+        params["api_key"] = self.key
+
+        # Sort parameters alphabetically
+        sorted_params = sorted(params.items())
+
+        # Create parameter string
+        query = "&".join(f"{k}={v}" for k, v in sorted_params)
+
+        # Add secret_key to the end
+        sign_string = query + "&secret_key=" + self.secret
+
+        # Generate MD5 signature (uppercase)
+        signature = hashlib.md5(sign_string.encode()).hexdigest().upper()
+
+        params["sign"] = signature
         return params
 
     def _get(self, path, params=None):
@@ -40,9 +59,11 @@ class BiconomyAdapter(BaseAdapter):
         r.raise_for_status()
         return r.json()
 
-    def _post(self, path, data):
-        data = self._sign(data)
-        r = self.session.post(BASE + path, json=data, timeout=10)
+    def _post(self, path, data: dict):
+        """POST request using form-data format"""
+        signed = self._sign(data)
+        # Use data parameter instead of json for form-data
+        r = self.session.post(BASE + path, data=signed, timeout=10)
         r.raise_for_status()
         return r.json()
 
@@ -51,121 +72,113 @@ class BiconomyAdapter(BaseAdapter):
 
     def fetch_btc_last(self):
         try:
-            resp = self._get("/api/v1/tickers")
-            data = resp.get("ticker", []) or []
-            for t in data:
-                sym = t.get("symbol", "")
-                if sym in ("BTC_USDT", "BTC-USDT", "BTCUSDT"):
-                    return float(t.get("last") or t.get("lastPrice") or t.get("last_price"))
-            return 92000.0
+            r = self._get("/api/v1/tickers")
+            tickers = r.get("ticker", [])  # Note: key is "ticker" not "data"
+            for t in tickers:
+                symbol = t.get("symbol", "")
+                if symbol in ("BTC_USDT", "BTC-USDT", "BTCUSDT"):
+                    return float(t["last"])
         except Exception as e:
-            logger.error(f"Biconomy BTC error: {e}")
-            return 92000.0
+            logger.error(f"biconomy btc_last error: {e}")
+        return 92000.0
 
     def fetch_best_quotes(self):
         try:
-            resp = self._get("/api/v1/tickers")
-            data = resp.get("ticker", []) or []
-            # try multiple symbol formats
+            r = self._get("/api/v1/tickers")
+            tickers = r.get("ticker", [])  # Note: key is "ticker" not "data"
+
             variants = {
                 self.symbol,
-                (self.symbol.replace("_", "-") if self.symbol else ""),
-                (self.symbol.replace("_", "") if self.symbol else ""),
-                (self.symbol.replace("-", "_") if self.symbol else "")
+                self.symbol.replace("_", "-"),
+                self.symbol.replace("-", "_"),
+                self.symbol.replace("_", ""),
             }
-            for t in data:
+
+            for t in tickers:
                 if t.get("symbol") in variants:
-                    bid = t.get("buy") or t.get("bid")
-                    ask = t.get("sell") or t.get("ask")
-                    return float(bid), float(ask)
-            return None, None
+                    bid = t.get("buy")  # "buy" field for bid
+                    ask = t.get("sell")  # "sell" field for ask
+                    if bid and ask:
+                        return float(bid), float(ask)
+
         except Exception as e:
-            logger.error(f"Biconomy quotes error: {e}")
-            return None, None
+            logger.error(f"biconomy best quotes error: {e}")
+
+        return None, None
 
     def fetch_open_orders(self):
-        # In dry_run mode, return empty list to avoid API calls
         if self.dry_run:
             return []
-        
-        # Try a few symbol variants to avoid 404 due to format mismatch.
-        variants = []
-        if hasattr(self, "symbol") and self.symbol:
-            variants = [
-                self.symbol,
-                self.symbol.replace("_", "-"),
-                self.symbol.replace("_", ""),
-                self.symbol.replace("-", "_")
-            ]
-        else:
-            variants = ["OHO_USDT", "OHO-USDT", "OHOUSDT", "OHOUSDT"]
 
-        last_exc = None
-        for sym in variants:
-            try:
-                resp = self._get("/api/v1/order/openOrders", {"symbol": sym})
-                return resp.get("data", [])
-            except requests.HTTPError as e:
-                # 404 means endpoint doesn't exist or symbol not found - try next variant
-                if e.response.status_code == 404:
-                    last_exc = e
-                    continue
-                # Other HTTP errors (401, 403) are auth/permission issues - log and return empty
-                elif e.response.status_code in (401, 403):
-                    logger.debug(f"Biconomy fetch_open_orders: {e.response.status_code} - authentication/permission issue")
-                    return []
-                raise
-            except Exception as e:
-                last_exc = e
-                continue
-        
-        # If all variants failed with 404, try without symbol parameter
         try:
-            resp = self._get("/api/v1/order/openOrders")  # try without params
-            return resp.get("data", [])
-        except requests.HTTPError as e:
-            if e.response.status_code == 404:
-                logger.debug(f"Biconomy fetch_open_orders: endpoint not found (404) - may require authentication or different endpoint")
-            elif e.response.status_code in (401, 403):
-                logger.debug(f"Biconomy fetch_open_orders: authentication required (401/403)")
-            # Return empty list instead of raising in dry_run or when endpoint doesn't exist
-            return []
-        except Exception:
-            # Return empty list for any other errors
+            resp = self._post(
+                "/api/v1/private/order/pending",  # Correct endpoint
+                {
+                    "market": self.symbol,
+                    "offset": "0",
+                    "limit": "100"
+                }
+            )
+            result = resp.get("result", {})
+            return result.get("records", [])
+        except Exception as e:
+            logger.error(f"Biconomy open orders error: {e}")
             return []
 
     def cancel_orders_by_ids(self, ids):
         if self.dry_run or not ids:
             return
+
         for oid in ids:
             try:
-                self._post("/api/v1/order/cancel", {"orderId": oid})
+                self._post(
+                    "/api/v1/private/trade/cancel",  # Correct endpoint
+                    {
+                        "market": self.symbol,
+                        "order_id": str(oid)
+                    }
+                )
             except Exception as e:
                 logger.warning(f"Biconomy cancel {oid} failed: {e}")
 
     def create_limit(self, side, price, amount):
         if self.dry_run:
-            logger.info(f"[DRY] BICONOMY {side.upper()} {amount} @ {price:.10f}")
+            logger.info(f"[DRY] BICONOMY {side.upper()} {amount} @ {price}")
             return "dry"
+
+        # Map side: "buy" -> 2 (BID), "sell" -> 1 (ASK)
+        side_value = 2 if side.lower() == "buy" else 1
+
         payload = {
-            "symbol": self.symbol,
-            "side": "BUY" if side == "buy" else "SELL",
-            "type": "LIMIT",
-            "quantity": str(int(amount)),
-            "price": f"{price:.10f}",
-            "timeInForce": "POST_ONLY"
+            "market": self.symbol,
+            "side": str(side_value),  # 1=ASK (sell), 2=BID (buy)
+            "amount": f"{amount}",
+            "price": f"{price:.10f}"
         }
-        resp = self._post("/api/v1/order/place", payload)
-        return str(resp["data"]["orderId"])
+
+        try:
+            resp = self._post("/api/v1/private/trade/limit", payload)  # Correct endpoint
+
+            # Check response code
+            if resp.get("code") != 0:
+                logger.error(f"Biconomy order failed: {resp.get('message')}")
+                return None
+
+            result = resp.get("result", {})
+            oid = result.get("id")
+            return str(oid) if oid else None
+        except Exception as e:
+            logger.error(f"Biconomy create_limit error: {e}")
+            return None
 
     def price_to_precision(self, p):
         return round(p, 8)
 
     def amount_to_precision(self, a):
-        return int(round(a))
+        return int(a)
 
     def get_limits(self):
-        return {"min_amount": 1000, "min_cost": 1}
+        return {"min_amount": 1, "min_cost": 1}
 
     def get_steps(self):
-        return 1e-8, 1
+        return (1e-8, 1)

@@ -1,266 +1,505 @@
-# adapters/tapbit_adapter.py
 import os
 import time
 import hmac
 import hashlib
-import urllib.parse
 import requests
 import logging
 from .base import BaseAdapter
-from config import SETTINGS
 
 logger = logging.getLogger(__name__)
-# Use the correct Tapbit API base URL
+
 BASE = "https://openapi.tapbit.com"
 
 
 class TapbitAdapter(BaseAdapter):
+    """
+    Tapbit Spot API adapter with comprehensive logging.
+
+    Authentication:
+        - ACCESS-KEY: API key
+        - ACCESS-SIGN: HMAC-SHA256 signature
+        - ACCESS-TIMESTAMP: Unix timestamp in milliseconds
+
+    Signature format: timestamp + method + path + ?queryString + body
+    """
+
     def __init__(self, cfg):
         super().__init__(cfg)
-        # BaseAdapter is expected to expose: self.cfg, self.symbol, self.dry_run, self.api_key, self.secret
-        # But preserve your original fallback to os.getenv
-        self.key = os.getenv("TAPBIT_KEY", "") or getattr(self.cfg, "api_key_env", "")
-        self.secret = os.getenv("TAPBIT_SECRET", "") or getattr(self.cfg, "secret_env", "")
-        self.session = requests.Session()
-        if self.key:
-            self.session.headers.update({"X-API-KEY": self.key})
 
-    def _sign(self, params: dict) -> dict:
+        self.key = os.getenv("TAPBIT_KEY", "") or getattr(cfg, "api_key_env", "")
+        self.secret = os.getenv("TAPBIT_SECRET", "") or getattr(cfg, "secret_env", "")
+
+        # Log configuration status (without exposing secrets)
+        if self.key and self.secret:
+            logger.info(
+                f"Tapbit adapter initialized | API Key: {self.key[:8]}...{self.key[-4:]} | Symbol: {getattr(cfg, 'symbol', 'N/A')}")
+        else:
+            logger.warning("Tapbit adapter initialized without credentials | Running in limited mode")
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Content-Type": "application/json",
+            "User-Agent": "OHO-Bot/1.0"
+        })
+
+        # Request counters for monitoring
+        self._request_count = {"GET": 0, "POST": 0, "errors": 0}
+        self._last_request_time = None
+
+    # --------------------------------------------------------
+    # SIGNING
+    # --------------------------------------------------------
+    def _generate_signature(self, timestamp: str, method: str, path: str, query_string: str = "", body: str = ""):
+        """
+        Generate HMAC-SHA256 signature for Tapbit API.
+
+        Format: timestamp + method + path + ?queryString + body
+
+        Args:
+            timestamp: Unix timestamp in milliseconds
+            method: HTTP method (GET, POST)
+            path: API endpoint path
+            query_string: URL query parameters (without leading ?)
+            body: JSON request body
+
+        Returns:
+            Hexadecimal signature string
+        """
         if not self.secret:
-            logger.warning("Tapbit: No SECRET set — public calls only")
-            return params
-        params = params.copy()
-        params["timestamp"] = int(time.time() * 1000)
-        query_string = urllib.parse.urlencode(sorted(params.items()))
+            logger.debug("No secret configured, skipping signature generation")
+            return ""
+
+        # Build signature message
+        message = f"{timestamp}{method}{path}"
+
+        if query_string:
+            message += f"?{query_string}"
+
+        if body:
+            message += body
+
+        # Log signature details (without exposing secret)
+        logger.debug(
+            f"Signature input | Method: {method} | Path: {path} | QueryLen: {len(query_string)} | BodyLen: {len(body)}")
+
+        # Generate HMAC-SHA256 signature
         signature = hmac.new(
-            self.secret.encode("utf-8"),
-            query_string.encode("utf-8"),
+            self.secret.encode('utf-8'),
+            message.encode('utf-8'),
             hashlib.sha256
         ).hexdigest()
-        params["sign"] = signature
-        return params
 
-    def _post(self, path: str, data: dict):
-        url = BASE + path
-        signed_data = self._sign(data)
-        r = self.session.post(url, json=signed_data, timeout=15)
-        r.raise_for_status()
-        return r.json()
+        return signature
 
-    def _get(self, path: str, params=None):
-        if params is None:
-            params = {}
-        # Public market calls don't need signature. Try v1, fallback to v2 for market endpoints.
+    def _get_headers(self, method: str, path: str, query_string: str = "", body: str = ""):
+        """
+        Generate authentication headers for API request.
+
+        Returns:
+            Dictionary of HTTP headers including authentication
+        """
+        timestamp = str(int(time.time() * 1000))
+
+        headers = {
+            "ACCESS-KEY": self.key,
+            "ACCESS-TIMESTAMP": timestamp,
+            "Content-Type": "application/json"
+        }
+
+        if self.key and self.secret:
+            signature = self._generate_signature(timestamp, method, path, query_string, body)
+            headers["ACCESS-SIGN"] = signature
+            logger.debug(f"Auth headers generated | Timestamp: {timestamp} | Signature: {signature[:16]}...")
+        else:
+            logger.debug("No credentials, sending unauthenticated request")
+
+        return headers
+
+    # --------------------------------------------------------
+    # HTTP
+    # --------------------------------------------------------
+    def _post(self, path, data):
+        """
+        Execute authenticated POST request.
+
+        Args:
+            path: API endpoint path
+            data: Request payload dictionary
+
+        Returns:
+            JSON response dictionary
+
+        Raises:
+            HTTPError: On non-200 status codes
+        """
+        import json
+
+        self._request_count["POST"] += 1
+        request_id = f"POST-{self._request_count['POST']}"
+
+        body = json.dumps(data) if data else ""
+        headers = self._get_headers("POST", path, "", body)
+
+        logger.info(f"[{request_id}] POST {path} | Payload keys: {list(data.keys()) if data else []}")
+
+        start_time = time.time()
+
         try:
-            if "market/ticker" in path:
-                r = self.session.get(BASE + path, params=params, timeout=15)
-            else:
-                signed_params = self._sign(params)
-                r = self.session.get(BASE + path, params=signed_params, timeout=15)
+            r = self.session.post(
+                BASE + path,
+                data=body,
+                headers=headers,
+                timeout=10
+            )
+
+            elapsed = (time.time() - start_time) * 1000
+            self._last_request_time = time.time()
+
+            logger.info(
+                f"[{request_id}] Response: {r.status_code} | Time: {elapsed:.0f}ms | Size: {len(r.content)} bytes")
+
+            if r.status_code != 200:
+                self._request_count["errors"] += 1
+                logger.error(f"[{request_id}] HTTP {r.status_code} | Response: {r.text[:500]}")
+                logger.error(f"[{request_id}] Request headers: {dict(r.request.headers)}")
+                logger.error(f"[{request_id}] Request body: {body[:500]}")
+
             r.raise_for_status()
-            return r.json()
-        except requests.HTTPError as e:
-            status = getattr(e.response, "status_code", None)
-            if status in (403, 404) and "market/ticker" in path:
-                # try swapping /v1/ -> /v2/ (fallback)
-                alt_path = path.replace("/v1/", "/v2/")
-                try:
-                    r = self.session.get(BASE + alt_path, params=params, timeout=15)
-                    r.raise_for_status()
-                    return r.json()
-                except Exception:
-                    raise
+
+            response_data = r.json()
+
+            # Log API-level errors
+            if response_data.get("code") != 0:
+                logger.error(
+                    f"[{request_id}] API Error | Code: {response_data.get('code')} | Message: {response_data.get('msg', 'N/A')}")
+            else:
+                logger.debug(f"[{request_id}] API Success | Response keys: {list(response_data.keys())}")
+
+            return response_data
+
+        except requests.exceptions.Timeout:
+            self._request_count["errors"] += 1
+            logger.error(f"[{request_id}] Request timeout after 10s")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            self._request_count["errors"] += 1
+            logger.error(f"[{request_id}] Connection error: {str(e)}")
+            raise
+        except requests.exceptions.HTTPError as e:
+            # Already logged above
+            raise
+        except Exception as e:
+            self._request_count["errors"] += 1
+            logger.error(f"[{request_id}] Unexpected error: {type(e).__name__} - {str(e)}")
             raise
 
-    def connect(self):
-        logger.info("Tapbit adapter ready — using openapi.tapbit.com")
+    def _get(self, path, params=None):
+        """
+        Execute GET request (public or authenticated).
 
-    def fetch_btc_last(self) -> float:
-        # Try correct Tapbit API endpoints: /api/spot/instruments/ticker_one
-        # Also try legacy endpoints as fallback
-        candidates = [
-            ("/api/spot/instruments/ticker_one", {"instrument_id": "BTC/USDT"}),
-            ("/api/spot/instruments/ticker_one", {"instrument_id": "BTCUSDT"}),
-            ("/v1/market/ticker", {"symbol": "BTC/USDT"}),
-            ("/v1/market/ticker", {"symbol": "BTCUSDT"}),
-            ("/v2/market/ticker", {"symbol": "BTCUSDT"}),
-        ]
-        last_error = None
-        for path, params in candidates:
-            try:
-                r = self.session.get(BASE + path, params=params, timeout=10)
-                r.raise_for_status()
-                j = r.json()
-                data = j.get("data", {})
-                # Try new API format first (last_price)
-                last = None
-                if isinstance(data, dict):
-                    last = data.get("last_price") or data.get("last") or data.get("lastPrice") or data.get("last_price")
-                else:
-                    last = j.get("last_price") or j.get("last") or j.get("lastPrice")
-                if last is None:
-                    continue
-                return float(last)
-            except requests.HTTPError as e:
-                last_error = f"{e.response.status_code} for {path}"
-                if e.response.status_code not in (404, 403):
-                    # For non-404/403 errors, log and continue trying
-                    logger.debug(f"Tapbit BTC: {path} returned {e.response.status_code}")
-                continue
-            except Exception as e:
-                last_error = str(e)
-                continue
-        
-        # Log at appropriate level: debug in dry_run (expected), warning otherwise
-        if self.dry_run:
-            logger.debug(f"Tapbit BTC: all fallback attempts failed (last: {last_error}), using fallback price")
-        else:
-            logger.warning(f"Tapbit BTC: all fallback attempts failed (last: {last_error}), using fallback price")
-        return 92000.0
+        Args:
+            path: API endpoint path
+            params: Query parameters dictionary
+
+        Returns:
+            JSON response dictionary
+
+        Raises:
+            HTTPError: On non-200 status codes
+        """
+        self._request_count["GET"] += 1
+        request_id = f"GET-{self._request_count['GET']}"
+
+        # Build query string for signature
+        query_string = ""
+        if params:
+            sorted_params = sorted(params.items())
+            query_string = "&".join([f"{k}={v}" for k, v in sorted_params])
+
+        headers = self._get_headers("GET", path, query_string, "")
+
+        logger.info(f"[{request_id}] GET {path} | Params: {params or 'none'}")
+
+        start_time = time.time()
+
+        try:
+            r = self.session.get(
+                BASE + path,
+                params=params or {},
+                headers=headers,
+                timeout=10
+            )
+
+            elapsed = (time.time() - start_time) * 1000
+            self._last_request_time = time.time()
+
+            logger.info(
+                f"[{request_id}] Response: {r.status_code} | Time: {elapsed:.0f}ms | Size: {len(r.content)} bytes")
+
+            if r.status_code != 200:
+                self._request_count["errors"] += 1
+                logger.error(f"[{request_id}] HTTP {r.status_code} | Response: {r.text[:500]}")
+
+                # Additional diagnostics for 403 errors
+                if r.status_code == 403:
+                    logger.error(f"[{request_id}] 403 FORBIDDEN - Possible causes:")
+                    logger.error(f"  1. IP not whitelisted in Tapbit API settings")
+                    logger.error(f"  2. Invalid API key or secret")
+                    logger.error(f"  3. Signature generation error")
+                    logger.error(f"  4. API permissions not enabled for this endpoint")
+                    logger.error(f"[{request_id}] Request URL: {r.url}")
+                    logger.error(f"[{request_id}] Request headers: {dict(r.request.headers)}")
+
+            r.raise_for_status()
+
+            response_data = r.json()
+
+            # Log API-level errors
+            if response_data.get("code") != 0:
+                logger.error(
+                    f"[{request_id}] API Error | Code: {response_data.get('code')} | Message: {response_data.get('msg', 'N/A')}")
+            else:
+                logger.debug(f"[{request_id}] API Success | Response keys: {list(response_data.keys())}")
+
+            return response_data
+
+        except requests.exceptions.Timeout:
+            self._request_count["errors"] += 1
+            logger.error(f"[{request_id}] Request timeout after 10s")
+            raise
+        except requests.exceptions.ConnectionError as e:
+            self._request_count["errors"] += 1
+            logger.error(f"[{request_id}] Connection error: {str(e)}")
+            raise
+        except requests.exceptions.HTTPError as e:
+            # Already logged above
+            raise
+        except Exception as e:
+            self._request_count["errors"] += 1
+            logger.error(f"[{request_id}] Unexpected error: {type(e).__name__} - {str(e)}")
+            raise
+
+    # --------------------------------------------------------
+    # PUBLIC
+    # --------------------------------------------------------
+    def connect(self):
+        """Initialize connection and log adapter status."""
+        logger.info("=" * 60)
+        logger.info("Tapbit Adapter Status")
+        logger.info("=" * 60)
+        logger.info(f"Base URL: {BASE}")
+        logger.info(f"Symbol: {getattr(self, 'symbol', 'N/A')}")
+        logger.info(f"Dry Run: {getattr(self, 'dry_run', False)}")
+        logger.info(f"Credentials: {'✓ Configured' if (self.key and self.secret) else '✗ Missing'}")
+        logger.info("=" * 60)
+
+    def fetch_btc_last(self):
+        """
+        Fetch current BTC/USDT price.
+
+        Returns:
+            float: Last traded price, or 92000.0 on error
+        """
+        logger.debug("Fetching BTC/USDT last price")
+
+        try:
+            r = self._get("/api/v1/spot/market/ticker", {"symbol": "BTCUSDT"})
+
+            if r.get("code") == 0 and "data" in r:
+                price = float(r["data"]["last"])
+                logger.info(f"BTC/USDT price fetched: ${price:,.2f}")
+                return price
+            else:
+                logger.error(f"Unexpected ticker response: {r}")
+                return 92000.0
+
+        except Exception as e:
+            logger.error(f"BTC price fetch failed: {type(e).__name__} - {str(e)}")
+            return 92000.0
 
     def fetch_best_quotes(self):
         """
-        Tapbit returns inconsistent formats.
-        This version normalizes all variants into (bid, ask).
+        Fetch best bid/ask prices for configured symbol.
+
+        Returns:
+            tuple: (bid_price, ask_price) or (None, None) on error
         """
+        symbol = self.symbol.replace("/", "")
+        logger.debug(f"Fetching quotes for {symbol}")
 
-        # Build symbol variants
-        variants = []
-        if hasattr(self, "symbol") and self.symbol:
-            variants.append(self.symbol)  # OHO/USDT
-            variants.append(self.symbol.replace("/", ""))  # OHOUSDT
-            variants.append(self.symbol.replace("/", "_"))  # OHO_USDT
-        else:
-            variants = ["OHO/USDT", "OHOUSDT", "OHO_USDT"]
-
-        endpoints = [
-            "/api/spot/instruments/ticker_one",
-            "/v1/market/ticker",
-            "/v2/market/ticker",
-        ]
-
-        last_error = None
-
-        for sym in variants:
-            for ep in endpoints:
-                try:
-                    r = self.session.get(BASE + ep, params={"symbol": sym, "instrument_id": sym}, timeout=10)
-                    r.raise_for_status()
-                    j = r.json()
-                    d = j.get("data", {})
-
-                    # CASE 1: direct dict with bid/ask
-                    if isinstance(d, dict):
-                        bid = (
-                                d.get("highest_bid") or d.get("bid") or
-                                d.get("bestBid") or d.get("buy")
-                        )
-                        ask = (
-                                d.get("lowest_ask") or d.get("ask") or
-                                d.get("bestAsk") or d.get("sell")
-                        )
-                        if bid and ask:
-                            return float(bid), float(ask)
-
-                    # CASE 2: array inside `tickers`
-                    if isinstance(d, dict) and isinstance(d.get("tickers"), list) and len(d["tickers"]) > 0:
-                        t = d["tickers"][0]
-                        bid = t.get("bid") or t.get("buy")
-                        ask = t.get("ask") or t.get("sell")
-                        if bid and ask:
-                            return float(bid), float(ask)
-
-                except Exception as e:
-                    last_error = str(e)
-                    continue
-
-        # If no quotes found
-        if self.dry_run:
-            logger.debug(f"Tapbit quotes: all attempts failed (last: {last_error})")
-        else:
-            logger.warning(f"Tapbit quotes: all attempts failed (last: {last_error})")
-
-        return None, None
-
-    def fetch_open_orders(self):
-        # In dry_run mode, return empty list to avoid API calls
-        if self.dry_run:
-            return []
-        
-        # Original implementation posted to /v1/order/openOrders; try v1 then v2
-        payload = {"symbol": self.symbol}
         try:
-            resp = self._post("/v1/order/openOrders", payload)
-            return resp.get("data", [])
-        except requests.HTTPError as e:
-            # 403/401 means auth issue - return empty instead of raising
-            if e.response.status_code in (401, 403):
-                logger.debug(f"Tapbit fetch_open_orders: authentication required (401/403)")
-                return []
-            # Try v2 as fallback for other errors
-            try:
-                resp = self._post("/v2/order/openOrders", payload)
-                return resp.get("data", [])
-            except requests.HTTPError as e2:
-                if e2.response.status_code in (401, 403):
-                    logger.debug(f"Tapbit fetch_open_orders: v2 also requires authentication (401/403)")
-                    return []
-                # Re-raise other errors
-                raise
+            r = self._get("/api/v1/spot/market/ticker", {"symbol": symbol})
+
+            if r.get("code") == 0 and "data" in r:
+                d = r["data"]
+                bid = float(d["bid"])
+                ask = float(d["ask"])
+                spread = ask - bid
+                spread_pct = (spread / bid) * 100 if bid > 0 else 0
+
+                logger.info(
+                    f"{symbol} quotes | Bid: {bid:.8f} | Ask: {ask:.8f} | Spread: {spread:.8f} ({spread_pct:.4f}%)")
+                return bid, ask
+            else:
+                logger.error(f"Unexpected quotes response: {r}")
+                return None, None
+
         except Exception as e:
-            # Try v2 as fallback
-            try:
-                resp = self._post("/v2/order/openOrders", payload)
-                return resp.get("data", [])
-            except Exception:
-                # Return empty list instead of raising - allows bot to continue
-                logger.debug(f"Tapbit fetch_open_orders: both v1 and v2 failed: {e}")
+            logger.error(f"Quotes fetch failed for {symbol}: {type(e).__name__} - {str(e)}")
+            return None, None
+
+    # --------------------------------------------------------
+    # PRIVATE
+    # --------------------------------------------------------
+    def fetch_open_orders(self):
+        """
+        Fetch all open orders for configured symbol.
+
+        Returns:
+            list: Open orders data, or empty list on error
+        """
+        if self.dry_run:
+            logger.debug("Dry run mode: skipping open orders fetch")
+            return []
+
+        symbol = self.symbol.replace("/", "")
+        logger.debug(f"Fetching open orders for {symbol}")
+
+        try:
+            resp = self._post("/api/v1/spot/open_order_list", {"symbol": symbol})
+
+            if resp.get("code") == 0:
+                orders = resp.get("data", [])
+                logger.info(f"Open orders fetched: {len(orders)} order(s) for {symbol}")
+
+                if orders:
+                    for order in orders:
+                        logger.debug(f"  Order {order.get('orderId')} | {order.get('side')} | "
+                                     f"Price: {order.get('orderPrice')} | Qty: {order.get('orderQty')} | "
+                                     f"Status: {order.get('status')}")
+
+                return orders
+            else:
+                logger.error(f"Open orders fetch failed: {resp}")
                 return []
+
+        except Exception as e:
+            logger.error(f"Open orders exception: {type(e).__name__} - {str(e)}")
+            return []
 
     def cancel_orders_by_ids(self, ids):
-        if self.dry_run or not ids:
+        """
+        Cancel orders by order IDs.
+
+        Args:
+            ids: List of order IDs to cancel
+        """
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would cancel {len(ids)} order(s): {ids}")
             return
+
+        if not ids:
+            logger.debug("No orders to cancel")
+            return
+
+        symbol = self.symbol.replace("/", "")
+        logger.info(f"Cancelling {len(ids)} order(s) for {symbol}")
+
+        success_count = 0
+        fail_count = 0
+
         for oid in ids:
             try:
-                self._post("/v1/order/cancel", {"orderId": str(oid)})
-                logger.debug(f"Tapbit canceled {oid}")
-            except Exception:
-                try:
-                    self._post("/v2/order/cancel", {"orderId": str(oid)})
-                    logger.debug(f"Tapbit canceled {oid} (v2)")
-                except Exception as e:
-                    logger.warning(f"Tapbit cancel {oid} failed: {e}")
+                resp = self._post("/api/v1/spot/cancel_order", {
+                    "orderId": str(oid),
+                    "symbol": symbol
+                })
 
-    def create_limit(self, side: str, price: float, amount: float):
+                if resp.get("code") == 0:
+                    logger.info(f"✓ Order {oid} cancelled successfully")
+                    success_count += 1
+                else:
+                    logger.warning(f"✗ Order {oid} cancel failed | Code: {resp.get('code')} | Msg: {resp.get('msg')}")
+                    fail_count += 1
+
+            except Exception as e:
+                logger.warning(f"✗ Order {oid} cancel exception: {type(e).__name__} - {str(e)}")
+                fail_count += 1
+
+        logger.info(f"Cancel summary: {success_count} succeeded, {fail_count} failed")
+
+    def create_limit(self, side, price, amount):
+        """
+        Create a limit order.
+
+        Args:
+            side: "buy" or "sell"
+            price: Order price
+            amount: Order quantity
+
+        Returns:
+            str: Order ID on success, None on failure, "dry" in dry run mode
+        """
         if self.dry_run:
-            logger.info(f"[DRY] TAPBIT {side.upper()} {amount} @ {price:.10f}")
+            logger.info(
+                f"[DRY RUN] {side.upper()} order | Price: {price:.8f} | Qty: {amount} | Value: ${price * amount:.2f}")
             return "dry"
 
+        symbol = self.symbol.replace("/", "")
+
         payload = {
-            "symbol": self.symbol,
-            "side": "BUY" if side == "buy" else "SELL",
-            "orderQty": str(int(amount)),
+            "symbol": symbol,
+            "side": side.upper(),
             "orderPrice": f"{price:.10f}",
+            "orderQty": str(amount),
             "orderType": "LIMIT",
             "timeInForce": "POST_ONLY"
         }
 
-        # try v1 placing, fallback to v2 if needed
-        try:
-            resp = self._post("/v1/order/place", payload)
-            return str(resp["data"]["orderId"])
-        except Exception:
-            resp = self._post("/v2/order/place", payload)
-            return str(resp["data"]["orderId"])
+        logger.info(f"Creating LIMIT order | Symbol: {symbol} | Side: {side.upper()} | "
+                    f"Price: {price:.8f} | Qty: {amount} | Value: ${price * amount:.2f}")
 
-    def price_to_precision(self, p: float) -> float:
+        try:
+            resp = self._post("/api/v1/spot/order", payload)
+
+            if resp.get("code") == 0 and "data" in resp:
+                order_id = str(resp["data"]["orderId"])
+                logger.info(f"✓ Order created successfully | Order ID: {order_id}")
+                return order_id
+            else:
+                logger.error(f"✗ Order creation failed | Code: {resp.get('code')} | Msg: {resp.get('msg')}")
+                logger.error(f"Order details: {payload}")
+                return None
+
+        except Exception as e:
+            logger.error(f"✗ Order creation exception: {type(e).__name__} - {str(e)}")
+            logger.error(f"Order details: {payload}")
+            return None
+
+    # --------------------------------------------------------
+    # PRECISION / LIMITS
+    # --------------------------------------------------------
+    def price_to_precision(self, p):
         return round(p, 8)
 
-    def amount_to_precision(self, a: float) -> float:
-        return int(round(a))
+    def amount_to_precision(self, a):
+        return int(a)
 
-    def get_limits(self) -> dict:
-        return {"min_amount": 1000, "min_cost": 1.0}
+    def get_limits(self):
+        return {"min_amount": 1, "min_cost": 1}
 
-    def get_steps(self) -> tuple:
-        return 1e-8, 1
+    def get_steps(self):
+        return (1e-8, 1)
+
+    def get_stats(self):
+        """
+        Get adapter statistics for monitoring.
+
+        Returns:
+            dict: Request statistics
+        """
+        return {
+            "requests": self._request_count,
+            "last_request": self._last_request_time,
+            "uptime": time.time() - (self._last_request_time or time.time())
+        }
