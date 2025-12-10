@@ -32,6 +32,9 @@ class TapbitAdapter(BaseAdapter):
             "Content-Type": "application/json"
         })
 
+        # Error deduplication
+        self._error_cache = {}
+
     # --------------------------------------------------------
     # SIGNING
     # --------------------------------------------------------
@@ -43,10 +46,7 @@ class TapbitAdapter(BaseAdapter):
         if not self.secret:
             return ""
 
-        # Create the message to sign
         message = f"{timestamp}{method}{path}{body}"
-
-        # Generate HMAC-SHA256 signature
         signature = hmac.new(
             self.secret.encode('utf-8'),
             message.encode('utf-8'),
@@ -71,6 +71,38 @@ class TapbitAdapter(BaseAdapter):
 
         return headers
 
+    def _smart_log(self, level, key, message):
+        """Log with deduplication - only log 1st, 10th, 50th occurrence"""
+        now = time.time()
+
+        if key not in self._error_cache:
+            self._error_cache[key] = {"count": 0, "last_time": now}
+
+        # Reset if 60s passed
+        if now - self._error_cache[key]["last_time"] > 60:
+            self._error_cache[key] = {"count": 0, "last_time": now}
+
+        self._error_cache[key]["count"] += 1
+        self._error_cache[key]["last_time"] = now
+        count = self._error_cache[key]["count"]
+
+        # Log at 1, 10, 50, 100, etc
+        if count == 1 or count == 10 or count == 50 or count % 100 == 0:
+            suffix = f" (×{count})" if count > 1 else ""
+            getattr(logger, level)(message + suffix)
+
+    def _parse_error(self, status_code, text):
+        """Extract clean error message"""
+        if status_code == 403 and "cloudfront" in text.lower():
+            return "CloudFront blocked"
+        elif status_code == 403:
+            return "Forbidden"
+        elif status_code == 401:
+            return "Auth failed"
+        elif status_code >= 500:
+            return "Server error"
+        return f"HTTP {status_code}"
+
     # --------------------------------------------------------
     # HTTP
     # --------------------------------------------------------
@@ -88,9 +120,9 @@ class TapbitAdapter(BaseAdapter):
             timeout=10
         )
 
-        # Log response for debugging
         if r.status_code != 200:
-            logger.error(f"POST {path} failed: {r.status_code} - {r.text}")
+            error = self._parse_error(r.status_code, r.text)
+            raise Exception(f"{error}")
 
         r.raise_for_status()
         return r.json()
@@ -103,9 +135,9 @@ class TapbitAdapter(BaseAdapter):
             timeout=10
         )
 
-        # Log response for debugging
         if r.status_code != 200:
-            logger.error(f"GET {path} failed: {r.status_code} - {r.text}")
+            error = self._parse_error(r.status_code, r.text)
+            raise Exception(f"{error}")
 
         r.raise_for_status()
         return r.json()
@@ -114,18 +146,16 @@ class TapbitAdapter(BaseAdapter):
     # PUBLIC
     # --------------------------------------------------------
     def connect(self):
-        logger.info("Tapbit adapter ready")
+        pass
 
     def fetch_btc_last(self):
         try:
             r = self._get("/api/v1/spot/market/ticker", {"symbol": "BTCUSDT"})
             if r.get("code") == 0 and "data" in r:
                 return float(r["data"]["last"])
-            else:
-                logger.error(f"Unexpected response: {r}")
-                return 92000.0
+            return 92000.0
         except Exception as e:
-            logger.error(f"tapbit btc_last error: {e}")
+            self._smart_log("error", "btc_price", f"TAPBIT ERROR: BTC price - {str(e)}")
             return 92000.0
 
     def fetch_best_quotes(self):
@@ -135,11 +165,9 @@ class TapbitAdapter(BaseAdapter):
             if r.get("code") == 0 and "data" in r:
                 d = r["data"]
                 return float(d["bid"]), float(d["ask"])
-            else:
-                logger.error(f"Unexpected response: {r}")
-                return None, None
+            return None, None
         except Exception as e:
-            logger.error(f"tapbit quotes error: {e}")
+            self._smart_log("error", "quotes", f"TAPBIT ERROR: Quotes - {str(e)}")
             return None, None
 
     # --------------------------------------------------------
@@ -155,11 +183,9 @@ class TapbitAdapter(BaseAdapter):
             })
             if resp.get("code") == 0:
                 return resp.get("data", [])
-            else:
-                logger.error(f"Open orders error: {resp}")
-                return []
+            return []
         except Exception as e:
-            logger.error(f"Tapbit open orders error: {e}")
+            self._smart_log("error", "open_orders", f"TAPBIT ERROR: Open orders - {str(e)}")
             return []
 
     def cancel_orders_by_ids(self, ids):
@@ -173,18 +199,18 @@ class TapbitAdapter(BaseAdapter):
                     "symbol": self.symbol.replace("/", "")
                 })
                 if resp.get("code") != 0:
-                    logger.warning(f"Tapbit cancel {oid} failed: {resp}")
+                    logger.warning(f"Cancel failed: {oid}")
             except Exception as e:
-                logger.warning(f"Tapbit cancel {oid} exception: {e}")
+                logger.warning(f"Cancel: {str(e)}")
 
     def create_limit(self, side, price, amount):
         if self.dry_run:
-            logger.info(f"[DRY] TAPBIT {side.upper()} {amount} @ {price}")
+            logger.info(f"[DRY] {side.upper()} {amount} @ {price}")
             return "dry"
 
         payload = {
             "symbol": self.symbol.replace("/", ""),
-            "side": side.upper(),  # BUY or SELL
+            "side": side.upper(),
             "orderPrice": f"{price:.10f}",
             "orderQty": str(amount),
             "orderType": "LIMIT",
@@ -194,12 +220,14 @@ class TapbitAdapter(BaseAdapter):
         try:
             resp = self._post("/api/v1/spot/order", payload)
             if resp.get("code") == 0 and "data" in resp:
-                return str(resp["data"]["orderId"])
+                order_id = str(resp["data"]["orderId"])
+                logger.info(f"✓ TAPBIT {side.upper():4s} {amount:>8.0f} @ {price:.10f} [ID:{order_id}]")
+                return order_id
             else:
-                logger.error(f"Create order failed: {resp}")
+                # Silent rejection (normal market making)
                 return None
         except Exception as e:
-            logger.error(f"Create order exception: {e}")
+            self._smart_log("error", "create_order", f"TAPBIT ERROR: Order - {str(e)}")
             return None
 
     # --------------------------------------------------------
