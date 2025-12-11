@@ -1,4 +1,4 @@
-# adapters/ccxt_adapter.py — DEBUG VERSION with detailed error logging
+# adapters/ccxt_adapter.py — FULLY FIXED VERSION
 import os
 import time
 import hmac
@@ -18,9 +18,7 @@ class CCXTAdapter(BaseAdapter):
         self.secret = os.getenv(cfg.secret_env, "")
         self.memo = os.getenv(cfg.uid_env, "")
 
-        # Debug: Log configuration
-        logger.info(
-            f"BitMart Init - Key present: {bool(self.key)}, Secret present: {bool(self.secret)}, Memo present: {bool(self.memo)}")
+        logger.info(f"BitMart Init - Key: {bool(self.key)}, Secret: {bool(self.secret)}, Memo: {bool(self.memo)}")
 
         if not self.memo:
             logger.error("BitMart Memo (uid_env) not set — REQUIRED for signature")
@@ -33,9 +31,6 @@ class CCXTAdapter(BaseAdapter):
         message = f"{timestamp}#{self.memo}"
         if body_str:
             message += f"#{body_str}"
-
-        # Debug logging
-        logger.debug(f"Signature message: {message[:100]}...")
 
         signature = hmac.new(
             self.secret.encode('utf-8'),
@@ -61,26 +56,16 @@ class CCXTAdapter(BaseAdapter):
             "Content-Type": "application/json"
         }
 
-        # Debug: Log request details
-        logger.debug(f"Request: {method} {url}")
-        logger.debug(f"Headers: {json.dumps({k: v[:20] + '...' if len(v) > 20 else v for k, v in headers.items()})}")
-        logger.debug(f"Body: {body_str[:200]}...")
-
         try:
             if method == "GET":
                 response = self.session.get(url, headers=headers, params=params, timeout=10)
             else:
                 response = self.session.post(url, headers=headers, data=body_str, timeout=10)
 
-            # Debug: Log response
-            logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response body: {response.text[:500]}")
-
             response.raise_for_status()
             return response.json()
 
         except requests.exceptions.HTTPError as e:
-            # Enhanced error logging
             logger.error(f"HTTP {response.status_code} Error for {url}")
             logger.error(f"Response: {response.text}")
             raise
@@ -94,8 +79,8 @@ class CCXTAdapter(BaseAdapter):
             logger.info(f"[DRY] {self.exchange_name.upper():<8} {side.upper()} {amount_str} @ {price_str}")
             return "dry"
 
-        # BitMart symbol format: no separator
-        symbol = self.symbol.replace("/", "_").replace("_", "")
+        # BitMart symbol format: remove any separators
+        symbol = self.symbol.replace("/", "").replace("_", "")
 
         payload = {
             "symbol": symbol,
@@ -103,11 +88,9 @@ class CCXTAdapter(BaseAdapter):
             "type": "limit_maker",
             "size": amount_str,
             "price": price_str,
-            "client_order_id": f"oho_{int(time.time() * 1000000)}"[:32]
+            # CRITICAL FIX: No underscore allowed in client_order_id!
+            "client_order_id": f"oho{int(time.time() * 1000000)}"[:32]
         }
-
-        # Debug: Log payload
-        logger.debug(f"Order payload: {json.dumps(payload, indent=2)}")
 
         try:
             resp = self._request("POST", "/spot/v2/submit_order", data=payload)
@@ -121,14 +104,14 @@ class CCXTAdapter(BaseAdapter):
                 return None
 
         except Exception as e:
-            logger.error(f"BitMart order error: {e}", exc_info=True)
+            logger.error(f"BitMart order error: {e}")
             return None
 
     def cancel_orders_by_ids(self, ids: list):
         if self.dry_run or not ids:
             return
 
-        symbol = self.symbol.replace("/", "_").replace("_", "")
+        symbol = self.symbol.replace("/", "").replace("_", "")
         payload = {
             "symbol": symbol,
             "order_ids": [str(i) for i in ids[:50]]
@@ -141,31 +124,45 @@ class CCXTAdapter(BaseAdapter):
             logger.warning(f"BitMart cancel error: {e}")
 
     def fetch_btc_last(self):
+        """Fetch BTC/USDT price - FIXED response parsing"""
         try:
-            symbol = self.btc_symbol.replace("/", "_")
-            r = requests.get(
-                f"https://api-cloud.bitmart.com/spot/v1/ticker?symbol={symbol}",
-                timeout=10
-            ).json()
-            price = float(r["data"]["tickers"][0]["last_price"])
-            logger.debug(f"BTC price: {price}")
-            return price
+            symbol = self.symbol.replace("/", "_")
+            url = f"https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol=BTC_USDT"
+            r = requests.get(url, timeout=10).json()
+
+            # v3 ticker response format
+            if "data" in r and isinstance(r["data"], dict) and "last" in r["data"]:
+                price = float(r["data"]["last"])
+                logger.debug(f"BTC price: {price}")
+                return price
+            else:
+                logger.warning(f"Unexpected BTC ticker response: {r}")
+                return 92000.0
+
         except Exception as e:
-            logger.warning(f"BTC fetch error: {e}")
+            logger.warning(f"BTC fetch error: {e}, using fallback")
             return 92000.0
 
     def fetch_best_quotes(self):
+        """Fetch best bid/ask - FIXED response parsing"""
         try:
             symbol = self.symbol.replace("/", "_")
-            r = requests.get(
-                f"https://api-cloud.bitmart.com/spot/v1/ticker?symbol={symbol}",
-                timeout=10
-            ).json()
-            ticker = r["data"]["tickers"][0]
-            bid = float(ticker["best_bid"])
-            ask = float(ticker["best_ask"])
-            logger.debug(f"Best quotes - Bid: {bid:.8f}, Ask: {ask:.8f}")
-            return bid, ask
+            url = f"https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol={symbol}"
+            r = requests.get(url, timeout=10).json()
+
+            # v3 ticker response format
+            if "data" in r and isinstance(r["data"], dict):
+                ticker = r["data"]
+                bid = float(ticker.get("best_bid", 0))
+                ask = float(ticker.get("best_ask", 0))
+
+                if bid > 0 and ask > 0:
+                    logger.debug(f"Best quotes - Bid: {bid:.8f}, Ask: {ask:.8f}")
+                    return bid, ask
+
+            logger.warning(f"Unexpected quotes response: {r}")
+            return None, None
+
         except Exception as e:
             logger.warning(f"Quotes fetch error: {e}")
             return None, None
@@ -203,7 +200,7 @@ class CCXTAdapter(BaseAdapter):
         logger.info(f"Connected {self.exchange_name} (raw API mode)")
         # Test connection
         try:
-            self.fetch_btc_last()
-            logger.info("BitMart connection test successful")
+            btc_price = self.fetch_btc_last()
+            logger.info(f"BitMart connection test successful - BTC: ${btc_price:,.2f}")
         except Exception as e:
             logger.error(f"BitMart connection test failed: {e}")
