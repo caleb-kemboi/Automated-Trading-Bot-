@@ -45,7 +45,7 @@ class BotSettings:
     # 1) Reference price multiplier
     # Current market (Dec 11, 2025): OHO ≈ $0.00093-0.0012, BTC ≈ $90k-93k
     # Multiplier of 1.05e-8 yields mid ≈ 0.00093-0.00105
-    reference_multiplier: float = 1.05e-8
+    reference_multiplier: float = 1.1e-8
 
     # 2) Gap between orders: ABSOLUTE OHO unit gaps
     gap_min: float = 0.000001  # Minimum gap (OHO units)
