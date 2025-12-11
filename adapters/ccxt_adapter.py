@@ -1,7 +1,9 @@
-# adapters/ccxt_adapter.py — FINAL WITH REAL ORDER IDs (Dec 2025)
-import ccxt
+# adapters/bitmart_raw_adapter.py  ← RENAME THIS FILE TO ccxt_adapter.py
 import os
 import time
+import hmac
+import hashlib
+import requests
 import logging
 from .base import BaseAdapter
 
@@ -10,123 +12,107 @@ logger = logging.getLogger(__name__)
 class CCXTAdapter(BaseAdapter):
     def __init__(self, cfg):
         super().__init__(cfg)
+        self.key = os.getenv(cfg.api_key_env, "")
+        self.secret = os.getenv(cfg.secret_env, "")
+        self.memo = os.getenv(cfg.uid_env, "")  # BitMart "Memo" = UID
+        self.session = requests.Session()
+        self.session.headers.update({"X-BM-KEY": self.key})
 
-        init_args = {
-            'apiKey': os.getenv(cfg.api_key_env, ""),
-            'secret': os.getenv(cfg.secret_env, ""),
-            'enableRateLimit': True,
-            'options': {'defaultType': 'spot'},
-            'timeout': 30000,
-            'verbose': False,
+    def _sign(self, timestamp, method, path, body=""):
+        message = f"{timestamp}#{self.memo}#{method.upper()}#{path}"
+        if body:
+            message += f"#{body}"
+        signature = hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+        return signature
+
+    def _request(self, method, endpoint, params=None, data=None):
+        timestamp = str(int(time.time() * 1000))
+        url = f"https://api-cloud.bitmart.com{endpoint}"
+        body = data if data is None else requests.compat.json.dumps(data) if isinstance(data, dict) else data
+
+        signature = self._sign(timestamp, method, endpoint, body)
+
+        headers = {
+            "X-BM-KEY": self.key,
+            "X-BM-TIMESTAMP": timestamp,
+            "X-BM-SIGN": signature,
+            "Content-Type": "application/json"
         }
 
-        if getattr(cfg, "uid_env", None):
-            uid = os.getenv(cfg.uid_env, "")
-            if uid: init_args['uid'] = uid
-        if getattr(cfg, "hostname_env", None):
-            hostname = os.getenv(cfg.hostname_env)
-            if hostname: init_args['hostname'] = hostname
+        if method == "GET":
+            response = self.session.get(url, headers=headers, params=params, timeout=10)
+        else:
+            response = self.session.post(url, headers=headers, data=body, timeout=10)
 
-        self.client = getattr(ccxt, cfg.id)(init_args)
-        self._markets_loaded = False
-
-    def connect(self):
-        try:
-            self.client.load_markets()
-            self._markets_loaded = True
-            logger.info(f"Connected {self.exchange_name} — {self.symbol}")
-        except:
-            logger.warning(f"{self.exchange_name}: load_markets failed — limited mode")
-            self._markets_loaded = False
+        response.raise_for_status()
+        return response.json()
 
     def create_limit(self, side, price, amount):
-        price = self.price_to_precision(price)
-        amount = self.amount_to_precision(amount)
+        # FINAL FIX: price as string with exactly 8 decimals
+        price_str = f"{price:.8f}"
+        amount_str = f"{amount:f}".rstrip("0").rstrip(".") if amount.is_integer() else f"{amount:.0f}"
 
         if self.dry_run:
-            logger.info(f"[DRY] {self.exchange_name.upper():<8} {side.upper()} {amount:>8.0f} @ {price:.10f}")
+            logger.info(f"[DRY] {self.exchange_name.upper():<8} {side.upper()} {amount_str} @ {price_str}")
             return "dry"
 
-        params = {"postOnly": True}
-        if self.exchange_name.lower() == "bitmart":
-            params["timeInForce"] = "PO"
-
-        # Unique clientOrderId to help extract real ID later
-        client_oid = f"oho_{int(time.time()*1000000)}"
-        params["clientOrderId"] = client_oid
+        payload = {
+            "symbol": self.symbol.replace("/", ""),  # OHOUSDT
+            "side": "buy" if side == "buy" else "sell",
+            "type": "limit",
+            "size": amount_str,
+            "price": price_str,
+            "time_in_force": "post_only",
+            "client_order_id": f"oho_{int(time.time()*1000000)}"
+        }
 
         try:
-            raw = self.client.create_order(self.symbol, "limit", side.lower(), amount, price, params)
-
-            # === EXTRACT REAL ORDER ID — works on ALL exchanges ===
-            oid = (
-                raw.get('id') or
-                raw.get('orderId') or
-                str(raw.get('info', {}).get('orderId')) or
-                str(raw.get('info', {}).get('order_id')) or
-                str(raw.get('info', {}).get('id')) or
-                raw.get('clientOrderId') or
-                "unknown"
-            )
-
-            logger.info(f"{self.exchange_name.upper():<8} {side.upper()} {amount:>8.0f} @ {price:.10f}  id={oid}")
-            return str(oid)
-
-        except Exception as e:
-            msg = str(e).lower()
-
-            # Known harmless CCXT parsing bugs — order WAS placed
-            if any(x in msg for x in ["nonetype", "lower", "upper", "replace", "symbol", "bitmart"]):
-                logger.info(f"{self.exchange_name.upper():<8} {side.upper()} {amount:>8.0f} @ {price:.10f}  id={client_oid} (parsed)")
-                return client_oid  # we know it went through
-
-            # Real temporary issues
-            if any(x in msg for x in ["balance", "insufficient", "nonce", "rate limit", "post only"]):
+            resp = self._request("POST", "/spot/v2/submit_order", data=payload)
+            if resp.get("code") == 1000:
+                oid = resp["data"]["order_id"]
+                logger.info(f"{self.exchange_name.upper():<8} {side.upper()} {amount_str} @ {price_str} id={oid}")
+                return str(oid)
+            else:
+                logger.warning(f"BitMart order failed: {resp}")
                 return None
-
-            # Everything else = real problem
-            logger.warning(f"{self.exchange_name} real error: {e}")
+        except Exception as e:
+            logger.warning(f"BitMart raw API error: {e}")
             return None
-
-    # ———— rest of methods unchanged (precision, fetch, etc.) ————
-    def fetch_btc_last(self):
-        try: return float(self.client.fetch_ticker(self.btc_symbol)['last'])
-        except: return 92000.0
-
-    def fetch_best_quotes(self):
-        try:
-            t = self.client.fetch_ticker(self.symbol)
-            return t.get('bid'), t.get('ask')
-        except: return None, None
-
-    def fetch_open_orders(self):
-        if self.dry_run: return []
-        try: return self.client.fetch_open_orders(self.symbol)
-        except: return []
 
     def cancel_orders_by_ids(self, ids):
         if self.dry_run or not ids: return
-        for oid in ids:
-            try: self.client.cancel_order(str(oid), self.symbol)
-            except: pass
+        payload = {"symbol": self.symbol.replace("/", ""), "order_ids": ids[:50]}  # max 50
+        try:
+            self._request("POST", "/spot/v2/batch_orders_cancel", data=payload)
+        except:
+            pass
 
-    def price_to_precision(self, p):
-        if self._markets_loaded and self.symbol in self.client.markets:
-            return float(self.client.price_to_precision(self.symbol, p))
-        return round(float(p), 8)
+    # Minimal required methods — others fall back safely
+    def fetch_btc_last(self):
+        try:
+            r = requests.get("https://api-cloud.bitmart.com/spot/v1/ticker?symbol=BTC_USDT").json()
+            return float(r["data"]["tickers"][0]["last_price"])
+        except:
+            return 92000.0
 
-    def amount_to_precision(self, a):
-        if self._markets_loaded and self.symbol in self.client.markets:
-            return float(self.client.amount_to_precision(self.symbol, a))
-        return float(round(float(a), 8))
+    def fetch_best_quotes(self):
+        try:
+            r = requests.get(f"https://api-cloud.bitmart.com/spot/v1/ticker?symbol={self.symbol.replace('/', '')}").json()
+            ticker = r["data"]["tickers"][0]
+            return float(ticker["best_bid"]), float(ticker["best_ask"])
+        except:
+            return None, None
 
-    def get_limits(self):
-        if self._markets_loaded and self.symbol in self.client.markets:
-            return self.client.markets[self.symbol]['limits']
-        return {"min_amount": 1.0, "min_cost": 1.0}
+    def fetch_open_orders(self):
+        if self.dry_run: return []
+        try:
+            r = self._request("GET", "/spot/v1/order/open_orders", params={"symbol": self.symbol.replace("/", "")})
+            return r.get("data", {}).get("orders", [])
+        except:
+            return []
 
-    def get_steps(self):
-        if self._markets_loaded and self.symbol in self.client.markets:
-            p = self.client.markets[self.symbol]['precision']
-            return 10 ** -p.get('price', 8), 10 ** -p.get('amount', 8)
-        return 1e-8, 1
+    def price_to_precision(self, p): return round(p, 8)
+    def amount_to_precision(self, a): return round(a, 0)
+    def get_limits(self): return {"min_amount": 1000, "min_cost": 1.0}
+    def get_steps(self): return 1e-8, 1
+    def connect(self): logger.info(f"Connected {self.exchange_name} (raw API mode)")
