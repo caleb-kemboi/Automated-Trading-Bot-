@@ -79,8 +79,8 @@ class CCXTAdapter(BaseAdapter):
             logger.info(f"[DRY] {self.exchange_name.upper():<8} {side.upper()} {amount_str} @ {price_str}")
             return "dry"
 
-        # BitMart symbol format: remove any separators
-        symbol = self.symbol.replace("/", "").replace("_", "")
+        # BitMart symbol format: Use underscore (e.g., OHO_USDT, BTC_USDT)
+        symbol = self.symbol.replace("/", "_")
 
         payload = {
             "symbol": symbol,
@@ -111,7 +111,8 @@ class CCXTAdapter(BaseAdapter):
         if self.dry_run or not ids:
             return
 
-        symbol = self.symbol.replace("/", "").replace("_", "")
+        # BitMart symbol format: Use underscore
+        symbol = self.symbol.replace("/", "_")
         payload = {
             "symbol": symbol,
             "order_ids": [str(i) for i in ids[:50]]

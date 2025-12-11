@@ -1,4 +1,4 @@
-# config.py — Final corrected configuration (December 11, 2025)
+# config.py — CORRECTED with proper BitMart symbol format
 from dataclasses import dataclass
 from typing import Optional, List
 
@@ -72,13 +72,14 @@ SETTINGS = BotSettings()
 EXCHANGES: List[ExchangeConfig] = [
     ExchangeConfig(
         id="bitmart",
-        symbol="OHOUSDT",
-        btc_symbol="BTCUSDT",
+        # FIXED: BitMart uses slash format in config, adapter converts to underscore
+        symbol="OHO/USDT",
+        btc_symbol="BTC/USDT",
         enabled=True,
-        dry_run=False,  # Live mode (test carefully first)
+        dry_run=False,  # Live mode
         api_key_env="BITMART_KEY",
         secret_env="BITMART_SECRET",
-        uid_env="BITMART_UID",
+        uid_env="BITMART_UID",  # CRITICAL: Must be set!
         hostname_env="BITMART_HOSTNAME"
     ),
     ExchangeConfig(
