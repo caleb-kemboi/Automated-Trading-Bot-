@@ -123,9 +123,10 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
     # ==================== BULLETPROOF CLEANUP — NO MORE PILING UP ====================
     try:
         if not adapter.dry_run:
-            # Cancel ALL open OHO/USDT orders — one call, no pagination, old-key, or ID issues
-            adapter._request("POST", "/spot/v2/cancel_orders", data={"symbol": "OHOUSDT"})
-            logger.info(f"{adapter.exchange_name} FULL CANCEL — clean slate every cycle")
+            # Cancel ALL open orders for the symbol (OHOUSDT)
+            resp = adapter._request("POST", "/spot/v1/order/cancel",
+                                    data={"symbol": "OHOUSDT"})
+            logger.info(f"{adapter.exchange_name} FULL CANCEL — {resp}")
     except Exception as e:
         logger.error(f"{adapter.exchange_name} cancel_all failed: {e}")
 
