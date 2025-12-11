@@ -31,14 +31,16 @@ class CCXTAdapter(BaseAdapter):
             msg += f"#{body_str}"
         return hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
-    def _sign_v4(self, timestamp: str) -> str:
-        return hmac.new(self.secret.encode(), timestamp.encode(), hashlib.sha256).hexdigest()
+    def _sign_v4(self, timestamp: str, body_str: str = "") -> str:
+        """v4 signature: timestamp#memo#body_string"""
+        msg = f"{timestamp}#{self.memo}#{body_str}"
+        return hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
 
     def _request(self, method: str, endpoint: str, params=None, data=None, version: str = "v2"):
         timestamp = str(int(time.time() * 1000))
         url = f"https://api-cloud.bitmart.com{endpoint}"
         body_str = json.dumps(data, separators=(',', ':')) if data else ""
-        signature = self._sign_v4(timestamp) if version == "v4" else self._sign_v2(timestamp, body_str)
+        signature = self._sign_v4(timestamp, body_str) if version == "v4" else self._sign_v2(timestamp, body_str)
 
         headers = {
             "X-BM-KEY": self.key,
@@ -75,7 +77,7 @@ class CCXTAdapter(BaseAdapter):
             "type": "limit_maker",
             "size": amount_str,
             "price": price_str,
-            "client_order_id": f"oho{int(time.time()*1000000)}"[:32]
+            "client_order_id": f"oho{int(time.time() * 1000000)}"[:32]
         }
 
         resp = self._request("POST", "/spot/v2/submit_order", data=payload, version="v2")
@@ -99,45 +101,31 @@ class CCXTAdapter(BaseAdapter):
             logger.warning(f"Batch cancel failed: {e}")
 
     def cancel_all_orders(self):
-        """Cancel ALL open orders using v2 batch cancel (more reliable)"""
+        """Cancel ALL open orders using v4 cancel_all endpoint"""
         if self.dry_run:
             logger.info(f"[DRY] {self.exchange_name} cancel all")
             return
 
         try:
-            # Fetch all open orders first
-            symbol = self.symbol.replace("/", "_")
-            resp = self._request("GET", "/spot/v2/orders",
-                                 params={"symbol": symbol, "orderState": "all"},
-                                 version="v2")
+            # Use v4 cancel_all endpoint with symbol in payload
+            payload = {
+                "symbol": self.symbol.replace("/", "_")
+            }
 
-            orders = resp.get("data", {}).get("orders", [])
-            if not orders:
-                logger.info(f"{self.exchange_name} no orders to cancel")
-                return
+            resp = self._request("POST", "/spot/v4/cancel_all", data=payload, version="v4")
 
-            # Extract order IDs
-            order_ids = [str(o.get("order_id")) for o in orders if o.get("order_id")]
-            if not order_ids:
-                return
-
-            # Cancel in batches of 50 (API limit)
-            for i in range(0, len(order_ids), 50):
-                batch = order_ids[i:i + 50]
-                payload = {
-                    "symbol": symbol,
-                    "order_ids": batch
-                }
-                self._request("POST", "/spot/v2/batch_orders_cancel", data=payload, version="v2")
-
-            logger.info(f"{self.exchange_name} cancelled {len(order_ids)} orders")
+            if resp.get("code") in [1000, "1000"]:
+                logger.info(f"{self.exchange_name} ALL CANCELLED — {resp.get('message', 'OK')}")
+            else:
+                logger.warning(f"{self.exchange_name} cancel_all response: {resp}")
 
         except Exception as e:
             logger.error(f"{self.exchange_name} cancel_all failed: {e}")
 
     def fetch_btc_last(self):
         try:
-            r = requests.get("https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol=BTC_USDT", timeout=10).json()
+            r = requests.get("https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol=BTC_USDT",
+                             timeout=10).json()
             return float(r["data"]["last"])
         except Exception as e:
             logger.warning(f"BTC fetch failed: {e}")
@@ -146,7 +134,8 @@ class CCXTAdapter(BaseAdapter):
     def fetch_best_quotes(self):
         try:
             symbol = self.symbol.replace("/", "_")
-            r = requests.get(f"https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol={symbol}", timeout=10).json()
+            r = requests.get(f"https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol={symbol}",
+                             timeout=10).json()
             if r.get("code") == 1000:
                 d = r["data"]
                 return float(d.get("bid_px", 0)), float(d.get("ask_px", 0))
@@ -155,20 +144,37 @@ class CCXTAdapter(BaseAdapter):
         return None, None
 
     def fetch_open_orders(self):
+        """Fetch ONLY open/pending orders"""
         if self.dry_run:
             return []
         try:
             symbol = self.symbol.replace("/", "_")
-            r = self._request("GET", "/spot/v2/orders", params={"symbol": symbol, "orderState": "all"}, version="v2")
-            return r.get("data", {}).get("orders", [])
+            # Use 'pending' to get only open orders, not filled/cancelled
+            r = self._request("GET", "/spot/v2/orders",
+                              params={"symbol": symbol, "orderState": "pending"},
+                              version="v2")
+
+            orders = r.get("data", {}).get("orders", [])
+
+            # Filter for truly open orders (status 2=pending, 4=partially_filled)
+            open_orders = [o for o in orders if o.get("status") in ["2", "4"]]
+
+            return open_orders
         except Exception as e:
             logger.warning(f"Fetch orders error: {e}")
             return []
 
-    def price_to_precision(self, p): return round(p, 8)
-    def amount_to_precision(self, a): return int(round(a))
-    def get_limits(self): return {"min_amount": 1000, "min_cost": 1.0}
-    def get_steps(self): return 1e-8, 1
+    def price_to_precision(self, p):
+        return round(p, 8)
+
+    def amount_to_precision(self, a):
+        return int(round(a))
+
+    def get_limits(self):
+        return {"min_amount": 1000, "min_cost": 1.0}
+
+    def get_steps(self):
+        return 1e-8, 1
 
     def connect(self):
         logger.info(f"Connected {self.exchange_name} (raw API mode)")
