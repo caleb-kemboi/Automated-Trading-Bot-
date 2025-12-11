@@ -99,14 +99,35 @@ class CCXTAdapter(BaseAdapter):
             logger.warning(f"Batch cancel failed: {e}")
 
     def cancel_all_orders(self):
+        """Cancel ALL open orders — correct v4 signature (timestamp#memo#POST#path)"""
         if self.dry_run:
             logger.info(f"[DRY] {self.exchange_name} cancel all")
             return
+
         try:
-            resp = self._request("POST", "/spot/v4/cancel_all", version="v4")
-            logger.info(f"{self.exchange_name} ALL CANCELLED")
+            timestamp = str(int(time.time() * 1000))
+            path = "/spot/v4/cancel_all"
+            method = "POST"
+
+            # CORRECT v4 signature: timestamp#memo#METHOD#PATH
+            message = f"{timestamp}#{self.memo}#{method.upper()}#{path}"
+            signature = hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
+            headers = {
+                "X-BM-KEY": self.key,
+                "X-BM-TIMESTAMP": timestamp,
+                "X-BM-SIGN": signature,
+                "Content-Type": "application/json"
+            }
+
+            url = f"https://api-cloud.bitmart.com{path}"
+            r = self.session.post(url, headers=headers, timeout=10)
+            r.raise_for_status()
+
+            resp = r.json()
+            logger.info(f"{self.exchange_name} ALL CANCELLED — {resp.get('message', 'OK')}")
         except Exception as e:
-            logger.error(f"cancel_all failed: {e}")
+            logger.error(f"{self.exchange_name} cancel_all failed: {e}")
 
     def fetch_btc_last(self):
         try:
