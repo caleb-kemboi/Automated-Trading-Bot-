@@ -1,4 +1,4 @@
-# runner.py — FINAL LIVE VERSION (Dec 11 2025 — NO MORE PILING UP)
+# runner.py — CLEANUP MOVED TO ADAPTER (UNIFIED)
 import random
 import logging
 from typing import Set, Optional
@@ -17,28 +17,33 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
     if prev_cycle_ids is None:
         prev_cycle_ids = set()
 
-    # Fetch BTC price
+    # Fetch BTC price with fallback
     try:
         btc_price = adapter.fetch_btc_last()
     except Exception as e:
         logger.warning(f"{adapter.exchange_name} BTC fetch failed: {e}, using fallback")
         btc_price = 92_000.0
 
+    # Calculate reference price (middle between buy and sell)
     mid_price = btc_price * SETTINGS.reference_multiplier
     if mid_price <= 0:
-        logger.warning(f"{adapter.exchange_name} invalid mid_price, skipping")
+        logger.warning(f"{adapter.exchange_name} mid_price invalid ({mid_price:.12f}), skipping cycle")
         return prev_cycle_ids
 
+    # Get exchange info
     limits = adapter.get_limits()
     price_step, amount_step = adapter.get_steps()
     tick = max(price_step, 1e-10)
     best_bid, best_ask = adapter.fetch_best_quotes() or (None, None)
 
+    # Random depth per client requirement
     depth = random.randint(SETTINGS.depth_min, SETTINGS.depth_max)
 
+    # Build ladders with ABSOLUTE gaps
     buy_prices = build_ladder(mid_price, "buy", depth, SETTINGS.gap_min, SETTINGS.gap_max)
     sell_prices = build_ladder(mid_price, "sell", depth, SETTINGS.gap_min, SETTINGS.gap_max)
 
+    # Random sizes per client requirement
     sizes_buy = random_sizes(depth, SETTINGS.size_min, SETTINGS.size_max)
     sizes_sell = random_sizes(depth, SETTINGS.size_min, SETTINGS.size_max)
 
@@ -48,22 +53,29 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
 
     # ==================== BUY SIDE ====================
     for i, (raw_price, raw_qty) in enumerate(zip(buy_prices, sizes_buy)):
+        # Manual precision for low prices
         if raw_price < 0.01:
             adjusted_price = round(raw_price, 8)
         else:
             adjusted_price = adapter.price_to_precision(raw_price)
 
+        # CRITICAL: Never buy above reference price
         if adjusted_price >= mid_price:
+            logger.warning(f"{adapter.exchange_name} BUY[{i}] REJECTED: price >= mid")
             rejected += 1
             continue
 
+        # Maker guard
         if best_ask is not None and SETTINGS.maker_guard_ticks > 0:
-            allowed = best_ask - SETTINGS.maker_guard_ticks * tick
-            if adjusted_price >= allowed:
-                adjusted_price = quantize_down(allowed, tick)
+            allowed_max = best_ask - SETTINGS.maker_guard_ticks * tick
+            if adjusted_price >= allowed_max:
+                adjusted_price = quantize_down(allowed_max, tick)
 
         adjusted_price = max(adjusted_price, tick)
+
+        # Final safety check
         if adjusted_price >= mid_price:
+            logger.warning(f"{adapter.exchange_name} BUY[{i}] REJECTED after adjustments")
             rejected += 1
             continue
 
@@ -80,7 +92,7 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             elif oid != "dry":
                 rejected += 1
         except Exception as e:
-            logger.warning(f"{adapter.exchange_name} BUY[{i}] failed: {e}")
+            logger.warning(f"{adapter.exchange_name} BUY[{i}] placement failed: {e}")
             rejected += 1
 
     # ==================== SELL SIDE ====================
@@ -90,17 +102,21 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
         else:
             adjusted_price = adapter.price_to_precision(raw_price)
 
+        # CRITICAL: Never sell below reference price
         if adjusted_price <= mid_price:
+            logger.warning(f"{adapter.exchange_name} SELL[{i}] REJECTED: price <= mid")
             rejected += 1
             continue
 
         if best_bid is not None and SETTINGS.maker_guard_ticks > 0:
-            allowed = best_bid + SETTINGS.maker_guard_ticks * tick
-            if adjusted_price <= allowed:
-                adjusted_price = quantize_up(allowed, tick)
+            allowed_min = best_bid + SETTINGS.maker_guard_ticks * tick
+            if adjusted_price <= allowed_min:
+                adjusted_price = quantize_up(allowed_min, tick)
 
         adjusted_price = max(adjusted_price, tick)
+
         if adjusted_price <= mid_price:
+            logger.warning(f"{adapter.exchange_name} SELL[{i}] REJECTED after adjustments")
             rejected += 1
             continue
 
@@ -117,24 +133,23 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             elif oid != "dry":
                 rejected += 1
         except Exception as e:
-            logger.warning(f"{adapter.exchange_name} SELL[{i}] failed: {e}")
+            logger.warning(f"{adapter.exchange_name} SELL[{i}] placement failed: {e}")
             rejected += 1
 
-    # ==================== BULLETPROOF CLEANUP — NO MORE PILING UP ====================
+    # ==================== CLEANUP OLD ORDERS (MOVED TO ADAPTER) ====================
     try:
         if not adapter.dry_run:
-            # Cancel ALL open orders for the symbol (OHOUSDT)
-            resp = adapter._request("POST", "/spot/v1/order/cancel",
-                                    data={"symbol": "OHOUSDT"})
-            logger.info(f"{adapter.exchange_name} FULL CANCEL — {resp}")
+            # Call adapter's cancel_all (handles exchange-specific logic)
+            adapter.cancel_all_orders()
+            logger.info(f"{adapter.exchange_name} full cleanup complete")
     except Exception as e:
-        logger.error(f"{adapter.exchange_name} cancel_all failed: {e}")
+        logger.warning(f"{adapter.exchange_name} cleanup error: {e}")
 
-    # ==================== STATUS ====================
+    # ==================== STATUS REPORT ====================
     status = "live" if rejected == 0 else f"live ({rejected}/{attempted} rejected)"
     logger.info(
         f"{adapter.exchange_name.upper():<9} | BTC={btc_price:,.0f} | "
-        f"mid={mid_price:.10f} | depth={depth} | placed={len(new_order_ids)} | {status}"
+        f"ref={mid_price:.12f} | depth={depth} | placed={len(new_order_ids)} | {status}"
     )
 
     return new_order_ids
