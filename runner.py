@@ -14,19 +14,6 @@ logger = logging.getLogger("oho_bot")
 
 
 def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) -> Set[str]:
-    """
-    Execute one market-making cycle.
-
-    Client Requirements:
-    1. Reference price = BTC/USDT * multiplier (exact middle between buy/sell)
-    2. Random gaps between orders (absolute OHO units, e.g., 0.000001-0.000002)
-    3. Random depth (e.g., 15-20 orders per side)
-    4. Random sizes (e.g., 10,000-25,000 OHO per order)
-    5. CRITICAL: Never place sell orders below OR buy orders above reference price
-
-    Returns:
-        Set of new order IDs created this cycle
-    """
     if prev_cycle_ids is None:
         prev_cycle_ids = set()
 
@@ -49,14 +36,14 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
     tick = max(price_step, 1e-10)
     best_bid, best_ask = adapter.fetch_best_quotes() or (None, None)
 
-    # Random depth per client requirement (e.g., 15-20 orders each side)
+    # Random depth per client requirement
     depth = random.randint(SETTINGS.depth_min, SETTINGS.depth_max)
 
-    # Build ladders with ABSOLUTE gaps (e.g., 0.000001 to 0.000002 OHO)
+    # Build ladders with ABSOLUTE gaps
     buy_prices = build_ladder(mid_price, "buy", depth, SETTINGS.gap_min, SETTINGS.gap_max)
     sell_prices = build_ladder(mid_price, "sell", depth, SETTINGS.gap_min, SETTINGS.gap_max)
 
-    # Random sizes per client requirement (e.g., 10,000 to 25,000 OHO)
+    # Random sizes per client requirement
     sizes_buy = random_sizes(depth, SETTINGS.size_min, SETTINGS.size_max)
     sizes_sell = random_sizes(depth, SETTINGS.size_min, SETTINGS.size_max)
 
@@ -65,53 +52,38 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
     rejected = 0
 
     # ==================== BUY SIDE ====================
-    # STRICT RULE: All buy orders MUST be BELOW reference price
     for i, (raw_price, raw_qty) in enumerate(zip(buy_prices, sizes_buy)):
-        # Manual precision for very low prices (prevents CCXT input snap)
+        # Manual precision for low prices
         if raw_price < 0.01:
             adjusted_price = round(raw_price, 8)
-            logger.debug(f"{adapter.exchange_name} BUY[{i}] manual prec: {raw_price:.12f} -> {adjusted_price:.12f}")
         else:
             adjusted_price = adapter.price_to_precision(raw_price)
 
-        # CRITICAL CHECK 1: Reject any buy order >= reference price
+        # CRITICAL: Never buy above reference price
         if adjusted_price >= mid_price:
-            logger.warning(
-                f"{adapter.exchange_name} BUY[{i}] REJECTED: "
-                f"price {adjusted_price:.12f} >= reference {mid_price:.12f}"
-            )
+            logger.warning(f"{adapter.exchange_name} BUY[{i}] REJECTED: price >= mid")
             rejected += 1
             continue
 
-        # Top-of-book maker guard (prevent immediate fill against best ask)
+        # Maker guard
         if best_ask is not None and SETTINGS.maker_guard_ticks > 0:
             allowed_max = best_ask - SETTINGS.maker_guard_ticks * tick
             if adjusted_price >= allowed_max:
                 adjusted_price = quantize_down(allowed_max, tick)
-                logger.debug(f"{adapter.exchange_name} BUY[{i}] maker guard: -> {adjusted_price:.12f}")
 
-        # Ensure price meets minimum tick
         adjusted_price = max(adjusted_price, tick)
 
-        # CRITICAL CHECK 2: Final safety - double-check still below reference
+        # Final safety check
         if adjusted_price >= mid_price:
-            logger.warning(
-                f"{adapter.exchange_name} BUY[{i}] REJECTED after adjustments: "
-                f"price {adjusted_price:.12f} >= reference {mid_price:.12f}"
-            )
+            logger.warning(f"{adapter.exchange_name} BUY[{i}] REJECTED after adjustments")
             rejected += 1
             continue
 
-        # Validate quantity meets exchange limits
         qty = clamp_by_limits(raw_qty, adjusted_price, limits)
         if qty is None:
-            logger.debug(f"{adapter.exchange_name} BUY[{i}] rejected: qty below limits")
             continue
-
-        # Ensure minimum notional value
         qty = ensure_min_notional(adjusted_price, qty, limits, amount_step, adapter)
 
-        # Place order
         attempted += 1
         try:
             oid = adapter.create_limit("buy", adjusted_price, qty)
@@ -124,53 +96,35 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             rejected += 1
 
     # ==================== SELL SIDE ====================
-    # STRICT RULE: All sell orders MUST be ABOVE reference price
     for i, (raw_price, raw_qty) in enumerate(zip(sell_prices, sizes_sell)):
-        # Manual precision for very low prices
         if raw_price < 0.01:
             adjusted_price = round(raw_price, 8)
-            logger.debug(f"{adapter.exchange_name} SELL[{i}] manual prec: {raw_price:.12f} -> {adjusted_price:.12f}")
         else:
             adjusted_price = adapter.price_to_precision(raw_price)
 
-        # CRITICAL CHECK 1: Reject any sell order <= reference price
+        # CRITICAL: Never sell below reference price
         if adjusted_price <= mid_price:
-            logger.warning(
-                f"{adapter.exchange_name} SELL[{i}] REJECTED: "
-                f"price {adjusted_price:.12f} <= reference {mid_price:.12f}"
-            )
+            logger.warning(f"{adapter.exchange_name} SELL[{i}] REJECTED: price <= mid")
             rejected += 1
             continue
 
-        # Top-of-book maker guard (prevent immediate fill against best bid)
         if best_bid is not None and SETTINGS.maker_guard_ticks > 0:
             allowed_min = best_bid + SETTINGS.maker_guard_ticks * tick
             if adjusted_price <= allowed_min:
                 adjusted_price = quantize_up(allowed_min, tick)
-                logger.debug(f"{adapter.exchange_name} SELL[{i}] maker guard: -> {adjusted_price:.12f}")
 
-        # Ensure price meets minimum tick
         adjusted_price = max(adjusted_price, tick)
 
-        # CRITICAL CHECK 2: Final safety - double-check still above reference
         if adjusted_price <= mid_price:
-            logger.warning(
-                f"{adapter.exchange_name} SELL[{i}] REJECTED after adjustments: "
-                f"price {adjusted_price:.12f} <= reference {mid_price:.12f}"
-            )
+            logger.warning(f"{adapter.exchange_name} SELL[{i}] REJECTED after adjustments")
             rejected += 1
             continue
 
-        # Validate quantity meets exchange limits
         qty = clamp_by_limits(raw_qty, adjusted_price, limits)
         if qty is None:
-            logger.debug(f"{adapter.exchange_name} SELL[{i}] rejected: qty below limits")
             continue
-
-        # Ensure minimum notional value
         qty = ensure_min_notional(adjusted_price, qty, limits, amount_step, adapter)
 
-        # Place order
         attempted += 1
         try:
             oid = adapter.create_limit("sell", adjusted_price, qty)
@@ -183,15 +137,24 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             rejected += 1
 
     # ==================== CLEANUP OLD ORDERS ====================
-    # Seamlessly replace old orders with new ones (per client requirement #5)
     try:
         if not adapter.dry_run:
             open_orders = adapter.fetch_open_orders()
-            current_ids = {str(o.get("id")) for o in open_orders if o.get("id")}
+            current_ids = set()
+            for o in open_orders:
+                oid = o.get("id") or o.get("orderId") or o.get("info", {}).get("order_id")
+                if oid is not None:
+                    current_ids.add(str(oid))
+
             to_cancel = current_ids - new_order_ids
             if to_cancel:
-                logger.debug(f"{adapter.exchange_name} cancelling {len(to_cancel)} old orders")
+                logger.info(f"{adapter.exchange_name} cancelling {len(to_cancel)} old orders")
                 adapter.cancel_orders_by_ids(list(to_cancel))
+
+            # Emergency cap
+            if len(current_ids) > 40:
+                logger.warning(f"{adapter.exchange_name} forcing full cancel — {len(current_ids)} orders open!")
+                adapter.cancel_all_orders()
     except Exception as e:
         logger.warning(f"{adapter.exchange_name} cleanup error: {e}")
 
