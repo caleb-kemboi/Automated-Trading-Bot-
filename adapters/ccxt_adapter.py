@@ -99,7 +99,7 @@ class CCXTAdapter(BaseAdapter):
             logger.warning(f"Batch cancel failed: {e}")
 
     def cancel_all_orders(self):
-        """Cancel ALL open orders — correct v4 signature (timestamp#memo#POST#path)"""
+        """Cancel ALL open orders using correct v4 signature"""
         if self.dry_run:
             logger.info(f"[DRY] {self.exchange_name} cancel all")
             return
@@ -107,10 +107,10 @@ class CCXTAdapter(BaseAdapter):
         try:
             timestamp = str(int(time.time() * 1000))
             path = "/spot/v4/cancel_all"
-            method = "POST"
 
-            # CORRECT v4 signature: timestamp#memo#METHOD#PATH
-            message = f"{timestamp}#{self.memo}#{method.upper()}#{path}"
+            # v4 signature format: timestamp#memo#body_string
+            # For cancel_all, body is empty string
+            message = f"{timestamp}#{self.memo}#"
             signature = hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
             headers = {
@@ -121,7 +121,7 @@ class CCXTAdapter(BaseAdapter):
             }
 
             url = f"https://api-cloud.bitmart.com{path}"
-            r = self.session.post(url, headers=headers, timeout=10)
+            r = self.session.post(url, headers=headers, json={}, timeout=10)
             r.raise_for_status()
 
             resp = r.json()
