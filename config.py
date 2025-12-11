@@ -72,8 +72,8 @@ SETTINGS = BotSettings()
 EXCHANGES: List[ExchangeConfig] = [
     ExchangeConfig(
         id="bitmart",
-        symbol="OHO/USDT",
-        btc_symbol="BTC/USDT",
+        symbol="OHOUSDT",
+        btc_symbol="BTCUSDT",
         enabled=True,
         dry_run=False,  # Live mode (test carefully first)
         api_key_env="BITMART_KEY",
