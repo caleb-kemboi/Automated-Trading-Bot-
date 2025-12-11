@@ -55,7 +55,7 @@ class CCXTAdapter(BaseAdapter):
 
     def create_limit(self, side: str, price: float, amount: float):
         price_str = f"{price:.8f}"
-        amount_str = f"{int(round(amount))}"  # Whole units for OHO
+        amount_str = f"{int(round(amount))}"
 
         if self.dry_run:
             logger.info(f"[DRY] {self.exchange_name.upper():<8} {side.upper()} {amount_str} @ {price_str}")
@@ -64,17 +64,16 @@ class CCXTAdapter(BaseAdapter):
         payload = {
             "symbol": self.symbol.replace("/", ""),
             "side": "buy" if side == "buy" else "sell",
-            "type": "limit",
+            "type": "limit_maker",  # Post-only maker order
             "size": amount_str,
             "price": price_str,
-            "time_in_force": "post_only",
-            "client_order_id": f"oho_{int(time.time()*1000000)}"
+            "client_order_id": f"oho_{int(time.time() * 1000000)}"[:32]
         }
 
         try:
             resp = self._request("POST", "/spot/v2/submit_order", data=payload)
-            if resp.get("code") == "1000" or resp.get("code") == 1000:  # Some responses use string
-                oid = resp.get("data", {}).get("order_id", "unknown")
+            if resp.get("code") in ["1000", 1000]:
+                oid = resp.get("data", {}).get("order_id")
                 logger.info(f"{self.exchange_name.upper():<8} {side.upper()} {amount_str} @ {price_str} id={oid}")
                 return str(oid)
             else:
