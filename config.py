@@ -1,6 +1,7 @@
-# config.py — Fully updated and corrected (December 11, 2025)
+# config.py — Final corrected configuration (December 11, 2025)
 from dataclasses import dataclass
 from typing import Optional, List
+
 
 @dataclass
 class ExchangeConfig:
@@ -15,32 +16,56 @@ class ExchangeConfig:
     hostname_env: str = ""
     symbol_override: Optional[str] = None
 
+
 @dataclass
 class BotSettings:
-    # BTC peg: mid = BTC/USDT * reference_multiplier
-    # Current market (Dec 11, 2025): OHO/USDT ≈ $0.00093–0.0012, BTC/USDT ≈ $90,000–93,000
-    # Correct multiplier yields mid ≈ 0.00093–0.00105
+    """
+    Client Requirements (Original Specification):
+
+    1) Reference price: Pegged to fixed ratio of BTC/USDT
+       - Formula: mid_price = BTC/USDT * reference_multiplier
+       - This is the EXACT MIDDLE between buy and sell orders
+
+    2) Gap between orders: ABSOLUTE values in OHO units (NOT percentages)
+       - Example: 0.000001 to 0.000002 OHO
+       - Random gap chosen for each level
+
+    3) Random order depth: Number of orders on each side
+       - Example: 15-20 orders per side
+
+    4) Random order size: Amount of OHO per order
+       - Example: 10,000 to 25,000 OHO
+
+    5) Random time interval: Seconds between refresh cycles
+       - Example: 5-10 seconds
+
+    CRITICAL: Never place sell orders below reference price OR buy orders above reference price
+    """
+
+    # 1) Reference price multiplier
+    # Current market (Dec 11, 2025): OHO ≈ $0.00093-0.0012, BTC ≈ $90k-93k
+    # Multiplier of 1.05e-8 yields mid ≈ 0.00093-0.00105
     reference_multiplier: float = 1.05e-8
 
-    # Random gap between each order (client requirement: e.g., between 0.000001 – 0.000002 OHO)
-    gap_min: float = 0.000001
-    gap_max: float = 0.000002
+    # 2) Gap between orders: ABSOLUTE OHO unit gaps
+    gap_min: float = 0.000001  # Minimum gap (OHO units)
+    gap_max: float = 0.000002  # Maximum gap (OHO units)
 
-    # Random order depth per side (client requirement: between 15–20 orders on each side)
-    depth_min: int = 15
-    depth_max: int = 20
+    # 3) Random order depth (orders per side)
+    depth_min: int = 15  # Minimum orders per side
+    depth_max: int = 20  # Maximum orders per side
 
-    # Random order size (client requirement: between 10,000 – 25,000 OHO)
-    size_min: float = 10_000
-    size_max: float = 25_000
+    # 4) Random order size (OHO per order)
+    size_min: float = 10_000  # Minimum OHO per order
+    size_max: float = 25_000  # Maximum OHO per order
 
-    # Random refresh interval (client requirement: every 5–10 seconds)
-    interval_min_s: float = 5
-    interval_max_s: float = 10
+    # 5) Random refresh interval (seconds)
+    interval_min_s: float = 5  # Minimum seconds
+    interval_max_s: float = 10  # Maximum seconds
 
-    # Safety: distance from mid + maker guard
-    min_spread_bps: float = 10.0    # Reduced to prevent over-shifting on tiny prices
-    maker_guard_ticks: int = 3
+    # Safety features (not in original requirements but recommended)
+    maker_guard_ticks: int = 3  # Stay N ticks away from best bid/ask to avoid immediate fills
+
 
 SETTINGS = BotSettings()
 
@@ -50,14 +75,45 @@ EXCHANGES: List[ExchangeConfig] = [
         symbol="OHO/USDT",
         btc_symbol="BTC/USDT",
         enabled=True,
-        dry_run=False,   # Test live on BitMart first (as client requested)
+        dry_run=False,  # Live mode (test carefully first)
         api_key_env="BITMART_KEY",
         secret_env="BITMART_SECRET",
         uid_env="BITMART_UID",
         hostname_env="BITMART_HOSTNAME"
     ),
-    ExchangeConfig(id="p2b", symbol="OHO/USDT", btc_symbol="BTC/USDT", enabled=False, dry_run=True, api_key_env="P2B_KEY", secret_env="P2B_SECRET"),
-    ExchangeConfig(id="dextrade", symbol="OHOUSDT", btc_symbol="BTCUSDT", enabled=False, dry_run=True, api_key_env="DEXTRADE_KEY"),
-    ExchangeConfig(id="biconomy", symbol="OHO_USDT", btc_symbol="BTC_USDT", enabled=False, dry_run=True, api_key_env="BICONOMY_KEY", secret_env="BICONOMY_SECRET"),
-    ExchangeConfig(id="tapbit", symbol="OHOUSDT", btc_symbol="BTCUSDT", enabled=False, dry_run=True, api_key_env="TAPBIT_KEY", secret_env="TAPBIT_SECRET"),
+    ExchangeConfig(
+        id="p2b",
+        symbol="OHO/USDT",
+        btc_symbol="BTC/USDT",
+        enabled=False,
+        dry_run=True,
+        api_key_env="P2B_KEY",
+        secret_env="P2B_SECRET"
+    ),
+    ExchangeConfig(
+        id="dextrade",
+        symbol="OHOUSDT",
+        btc_symbol="BTCUSDT",
+        enabled=False,
+        dry_run=True,
+        api_key_env="DEXTRADE_KEY"
+    ),
+    ExchangeConfig(
+        id="biconomy",
+        symbol="OHO_USDT",
+        btc_symbol="BTC_USDT",
+        enabled=False,
+        dry_run=True,
+        api_key_env="BICONOMY_KEY",
+        secret_env="BICONOMY_SECRET"
+    ),
+    ExchangeConfig(
+        id="tapbit",
+        symbol="OHOUSDT",
+        btc_symbol="BTCUSDT",
+        enabled=False,
+        dry_run=True,
+        api_key_env="TAPBIT_KEY",
+        secret_env="TAPBIT_SECRET"
+    ),
 ]
