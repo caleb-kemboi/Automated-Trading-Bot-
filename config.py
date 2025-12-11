@@ -52,12 +52,12 @@ class BotSettings:
     gap_max: float = 0.000002  # Maximum gap (OHO units)
 
     # 3) Random order depth (orders per side)
-    depth_min: int = 15  # Minimum orders per side
-    depth_max: int = 20  # Maximum orders per side
+    depth_min: int = 5   # Reduced from 15 to avoid balance issues
+    depth_max: int = 10  # Reduced from 20
 
     # 4) Random order size (OHO per order)
-    size_min: float = 10_000  # Minimum OHO per order
-    size_max: float = 25_000  # Maximum OHO per order
+    size_min: float = 5_000   # Reduced from 10,000
+    size_max: float = 15_000  # Reduced from 25,000
 
     # 5) Random refresh interval (seconds)
     interval_min_s: float = 5  # Minimum seconds
@@ -72,7 +72,6 @@ SETTINGS = BotSettings()
 EXCHANGES: List[ExchangeConfig] = [
     ExchangeConfig(
         id="bitmart",
-        # FIXED: BitMart uses slash format in config, adapter converts to underscore
         symbol="OHO/USDT",
         btc_symbol="BTC/USDT",
         enabled=True,

@@ -151,17 +151,18 @@ class CCXTAdapter(BaseAdapter):
             url = f"https://api-cloud.bitmart.com/spot/quotation/v3/ticker?symbol={symbol}"
             r = requests.get(url, timeout=10).json()
 
-            # v3 ticker response format
-            if "data" in r and isinstance(r["data"], dict):
+            # v3 ticker response: {"code": 1000, "data": {...}}
+            if r.get("code") == 1000 and "data" in r:
                 ticker = r["data"]
-                bid = float(ticker.get("best_bid", 0))
-                ask = float(ticker.get("best_ask", 0))
+                # Use bid_px/ask_px for v3 ticker
+                bid = float(ticker.get("bid_px", ticker.get("best_bid", 0)))
+                ask = float(ticker.get("ask_px", ticker.get("best_ask", 0)))
 
                 if bid > 0 and ask > 0:
                     logger.debug(f"Best quotes - Bid: {bid:.8f}, Ask: {ask:.8f}")
                     return bid, ask
 
-            logger.warning(f"Unexpected quotes response: {r}")
+            logger.warning(f"Unexpected quotes response format")
             return None, None
 
         except Exception as e:
@@ -173,10 +174,11 @@ class CCXTAdapter(BaseAdapter):
             return []
         try:
             symbol = self.symbol.replace("/", "_")
+            # Fixed: Use v2 endpoint for open orders
             r = self._request(
                 "GET",
-                "/spot/v1/order/open_orders",
-                params={"symbol": symbol}
+                "/spot/v2/orders",
+                params={"symbol": symbol, "orderState": "all"}
             )
             orders = r.get("data", {}).get("orders", [])
             logger.debug(f"Open orders: {len(orders)}")
