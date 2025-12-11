@@ -99,33 +99,39 @@ class CCXTAdapter(BaseAdapter):
             logger.warning(f"Batch cancel failed: {e}")
 
     def cancel_all_orders(self):
-        """Cancel ALL open orders using correct v4 signature"""
+        """Cancel ALL open orders using v2 batch cancel (more reliable)"""
         if self.dry_run:
             logger.info(f"[DRY] {self.exchange_name} cancel all")
             return
 
         try:
-            timestamp = str(int(time.time() * 1000))
-            path = "/spot/v4/cancel_all"
+            # Fetch all open orders first
+            symbol = self.symbol.replace("/", "_")
+            resp = self._request("GET", "/spot/v2/orders",
+                                 params={"symbol": symbol, "orderState": "all"},
+                                 version="v2")
 
-            # v4 signature format: timestamp#memo#body_string
-            # For cancel_all, body is empty string
-            message = f"{timestamp}#{self.memo}#"
-            signature = hmac.new(self.secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+            orders = resp.get("data", {}).get("orders", [])
+            if not orders:
+                logger.info(f"{self.exchange_name} no orders to cancel")
+                return
 
-            headers = {
-                "X-BM-KEY": self.key,
-                "X-BM-TIMESTAMP": timestamp,
-                "X-BM-SIGN": signature,
-                "Content-Type": "application/json"
-            }
+            # Extract order IDs
+            order_ids = [str(o.get("order_id")) for o in orders if o.get("order_id")]
+            if not order_ids:
+                return
 
-            url = f"https://api-cloud.bitmart.com{path}"
-            r = self.session.post(url, headers=headers, json={}, timeout=10)
-            r.raise_for_status()
+            # Cancel in batches of 50 (API limit)
+            for i in range(0, len(order_ids), 50):
+                batch = order_ids[i:i + 50]
+                payload = {
+                    "symbol": symbol,
+                    "order_ids": batch
+                }
+                self._request("POST", "/spot/v2/batch_orders_cancel", data=payload, version="v2")
 
-            resp = r.json()
-            logger.info(f"{self.exchange_name} ALL CANCELLED — {resp.get('message', 'OK')}")
+            logger.info(f"{self.exchange_name} cancelled {len(order_ids)} orders")
+
         except Exception as e:
             logger.error(f"{self.exchange_name} cancel_all failed: {e}")
 
