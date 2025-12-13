@@ -1,4 +1,5 @@
 # runner.py — CLEANUP MOVED TO ADAPTER (UNIFIED)
+
 import random
 import logging
 from typing import Set, Optional
@@ -17,33 +18,37 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
     if prev_cycle_ids is None:
         prev_cycle_ids = set()
 
-    # Fetch BTC price with fallback
+    # =====================================================
+    # CRITICAL: Reset per-cycle order tracking (SMART CANCEL)
+    # =====================================================
+    if hasattr(adapter, "current_cycle_order_ids"):
+        adapter.current_cycle_order_ids.clear()
+
+    # ---------------- Fetch BTC price ----------------
     try:
         btc_price = adapter.fetch_btc_last()
     except Exception as e:
         logger.warning(f"{adapter.exchange_name} BTC fetch failed: {e}, using fallback")
         btc_price = 92_000.0
 
-    # Calculate reference price (middle between buy and sell)
+    # ---------------- Reference price ----------------
     mid_price = btc_price * SETTINGS.reference_multiplier
     if mid_price <= 0:
         logger.warning(f"{adapter.exchange_name} mid_price invalid ({mid_price:.12f}), skipping cycle")
         return prev_cycle_ids
 
-    # Get exchange info
+    # ---------------- Exchange info ----------------
     limits = adapter.get_limits()
     price_step, amount_step = adapter.get_steps()
     tick = max(price_step, 1e-10)
     best_bid, best_ask = adapter.fetch_best_quotes() or (None, None)
 
-    # Random depth per client requirement
+    # ---------------- Ladder params ----------------
     depth = random.randint(SETTINGS.depth_min, SETTINGS.depth_max)
 
-    # Build ladders with ABSOLUTE gaps
     buy_prices = build_ladder(mid_price, "buy", depth, SETTINGS.gap_min, SETTINGS.gap_max)
     sell_prices = build_ladder(mid_price, "sell", depth, SETTINGS.gap_min, SETTINGS.gap_max)
 
-    # Random sizes per client requirement
     sizes_buy = random_sizes(depth, SETTINGS.size_min, SETTINGS.size_max)
     sizes_sell = random_sizes(depth, SETTINGS.size_min, SETTINGS.size_max)
 
@@ -53,15 +58,10 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
 
     # ==================== BUY SIDE ====================
     for i, (raw_price, raw_qty) in enumerate(zip(buy_prices, sizes_buy)):
-        # Manual precision for low prices
-        if raw_price < 0.01:
-            adjusted_price = round(raw_price, 8)
-        else:
-            adjusted_price = adapter.price_to_precision(raw_price)
+        adjusted_price = round(raw_price, 8) if raw_price < 0.01 else adapter.price_to_precision(raw_price)
 
-        # CRITICAL: Never buy above reference price
+        # Never buy above reference
         if adjusted_price >= mid_price:
-            logger.warning(f"{adapter.exchange_name} BUY[{i}] REJECTED: price >= mid")
             rejected += 1
             continue
 
@@ -73,15 +73,14 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
 
         adjusted_price = max(adjusted_price, tick)
 
-        # Final safety check
         if adjusted_price >= mid_price:
-            logger.warning(f"{adapter.exchange_name} BUY[{i}] REJECTED after adjustments")
             rejected += 1
             continue
 
         qty = clamp_by_limits(raw_qty, adjusted_price, limits)
         if qty is None:
             continue
+
         qty = ensure_min_notional(adjusted_price, qty, limits, amount_step, adapter)
 
         attempted += 1
@@ -92,19 +91,15 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             elif oid != "dry":
                 rejected += 1
         except Exception as e:
-            logger.warning(f"{adapter.exchange_name} BUY[{i}] placement failed: {e}")
+            logger.warning(f"{adapter.exchange_name} BUY[{i}] failed: {e}")
             rejected += 1
 
     # ==================== SELL SIDE ====================
     for i, (raw_price, raw_qty) in enumerate(zip(sell_prices, sizes_sell)):
-        if raw_price < 0.01:
-            adjusted_price = round(raw_price, 8)
-        else:
-            adjusted_price = adapter.price_to_precision(raw_price)
+        adjusted_price = round(raw_price, 8) if raw_price < 0.01 else adapter.price_to_precision(raw_price)
 
-        # CRITICAL: Never sell below reference price
+        # Never sell below reference
         if adjusted_price <= mid_price:
-            logger.warning(f"{adapter.exchange_name} SELL[{i}] REJECTED: price <= mid")
             rejected += 1
             continue
 
@@ -116,13 +111,13 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
         adjusted_price = max(adjusted_price, tick)
 
         if adjusted_price <= mid_price:
-            logger.warning(f"{adapter.exchange_name} SELL[{i}] REJECTED after adjustments")
             rejected += 1
             continue
 
         qty = clamp_by_limits(raw_qty, adjusted_price, limits)
         if qty is None:
             continue
+
         qty = ensure_min_notional(adjusted_price, qty, limits, amount_step, adapter)
 
         attempted += 1
@@ -133,19 +128,18 @@ def run_once(adapter: BaseAdapter, prev_cycle_ids: Optional[Set[str]] = None) ->
             elif oid != "dry":
                 rejected += 1
         except Exception as e:
-            logger.warning(f"{adapter.exchange_name} SELL[{i}] placement failed: {e}")
+            logger.warning(f"{adapter.exchange_name} SELL[{i}] failed: {e}")
             rejected += 1
 
-    # ==================== CLEANUP OLD ORDERS (MOVED TO ADAPTER) ====================
+    # ==================== CLEANUP (ADAPTER-OWNED) ====================
     try:
         if not adapter.dry_run:
-            # Call adapter's cancel_all (handles exchange-specific logic)
             adapter.cancel_all_orders()
             logger.info(f"{adapter.exchange_name} full cleanup complete")
     except Exception as e:
         logger.warning(f"{adapter.exchange_name} cleanup error: {e}")
 
-    # ==================== STATUS REPORT ====================
+    # ==================== STATUS ====================
     status = "live" if rejected == 0 else f"live ({rejected}/{attempted} rejected)"
     logger.info(
         f"{adapter.exchange_name.upper():<9} | BTC={btc_price:,.0f} | "

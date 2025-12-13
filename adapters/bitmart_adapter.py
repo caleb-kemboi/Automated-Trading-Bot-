@@ -89,7 +89,7 @@ class BitMartAdapter(BatchCancelMixin):
             return [
                 {"id": str(o["order_id"])}
                 for o in orders
-                if o.get("order_id") and o.get("status") in ["new", "partially_filled"]
+                if o.get("order_id") and o.get("status") in ["new", "submitted", "partially_filled"]
             ]
         except Exception as e:
             logger.warning(f"{self.exchange_name} fetch_open_orders error: {e}")
