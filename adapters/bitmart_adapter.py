@@ -24,6 +24,9 @@ class BitMartAdapter(BatchCancelMixin):
         self.session = requests.Session()
         self.session.headers.update({"X-BM-KEY": self.key})
 
+        # Track current cycle's order IDs (set by runner before cancel_all_orders)
+        self.current_cycle_order_ids: Set[str] = set()
+
     def _sign_v2(self, timestamp: str, body_str: str = "") -> str:
         """Sign for v2 endpoints."""
         msg = f"{timestamp}#{self.memo}"
@@ -92,6 +95,40 @@ class BitMartAdapter(BatchCancelMixin):
             logger.warning(f"{self.exchange_name} fetch_open_orders error: {e}")
             return []
 
+    def cancel_all_orders(self):
+        """
+        SMART CANCEL: Cancel ONLY stale orders (preserves current cycle's orders).
+        Called by runner AFTER placing new orders.
+
+        The runner has already placed new orders and stored their IDs in self.current_cycle_order_ids.
+        This method cancels everything EXCEPT those new orders.
+        """
+        if self.dry_run:
+            logger.info(f"[DRY] {self.exchange_name} skip cancel_all_orders()")
+            return
+
+        try:
+            # Fetch all open orders
+            open_orders = self.fetch_open_orders()
+            if not open_orders:
+                logger.debug(f"{self.exchange_name} no open orders found")
+                return
+
+            open_ids_now = {str(o["id"]) for o in open_orders if o.get("id")}
+
+            # CRITICAL: Cancel everything EXCEPT current cycle's orders
+            to_cancel = [oid for oid in open_ids_now if oid not in self.current_cycle_order_ids]
+
+            if to_cancel:
+                self.cancel_orders_by_ids(to_cancel)
+                logger.info(
+                    f"{self.exchange_name} removed {len(to_cancel)} stale orders | kept {len(self.current_cycle_order_ids)}")
+            else:
+                logger.debug(f"{self.exchange_name} no stale orders to cancel")
+
+        except Exception as e:
+            logger.error(f"{self.exchange_name} cancel_all_orders error: {e}")
+
     def cancel_orders_by_ids(self, order_ids: List[str]):
         """
         Cancel orders using BitMart's batch endpoint.
@@ -116,7 +153,9 @@ class BitMartAdapter(BatchCancelMixin):
         amount_str = str(int(round(amount)))
 
         if self.dry_run:
-            return f"dry_{int(time.time() * 1000000)}"
+            fake_id = f"dry_{int(time.time() * 1000000)}"
+            self.current_cycle_order_ids.add(fake_id)  # Track even in dry-run
+            return fake_id
 
         payload = {
             "symbol": self.symbol.replace("/", "_"),
@@ -130,9 +169,11 @@ class BitMartAdapter(BatchCancelMixin):
         try:
             resp = self._request("POST", "/spot/v2/submit_order", data=payload, version="v2")
             if resp.get("code") in ["1000", 1000]:
-                oid = resp.get("data", {}).get("order_id")
+                oid = str(resp.get("data", {}).get("order_id"))
                 logger.info(f"{self.exchange_name} {side.upper()} {amount_str} @ {price_str} id={oid}")
-                return str(oid)
+                # CRITICAL: Track this order ID so it won't be cancelled
+                self.current_cycle_order_ids.add(oid)
+                return oid
         except Exception as e:
             logger.warning(f"{self.exchange_name} create_limit error: {e}")
         return None
@@ -152,88 +193,3 @@ class BitMartAdapter(BatchCancelMixin):
 
     def get_precisions(self):
         return 8, 0
-
-    # ---------------- New: refresh orders (place ladder + cancel stale) ---------------- #
-    def refresh_orders(self, mid: float, depth: int = 20, gap_min: float = 0.000001, gap_max: float = 0.000002,
-                       size_min: float = 4200, size_max: float = 6000, min_spread_bps: float = 5.0,
-                       maker_guard_ticks: int = 2) -> Set[str]:
-        """
-        Place new ladder orders FIRST, then cancel only stale orders.
-        This is the key to maintaining continuous liquidity.
-
-        Returns: Set of newly placed order IDs
-        """
-        limits = self.get_limits()
-        best_bid, best_ask = self.fetch_best_quotes()
-        price_step, amount_step = self.get_steps()
-        tick = price_step
-
-        # Build ladders
-        def build_ladder(mid_val, side):
-            levels = []
-            acc = 0.0
-            for _ in range(depth):
-                step = random.uniform(gap_min, gap_max)
-                acc += step
-                levels.append(mid_val - acc if side == "buy" else mid_val + acc)
-            return levels
-
-        buy_prices = build_ladder(mid, "buy")
-        sell_prices = build_ladder(mid, "sell")
-        sizes_buy = [random.uniform(size_min, size_max) for _ in range(depth)]
-        sizes_sell = [random.uniform(size_min, size_max) for _ in range(depth)]
-
-        # Guard nearest levels from crossing
-        def guard_price(px, side):
-            if side == "buy" and best_ask is not None:
-                allowed_max = best_ask - maker_guard_ticks * tick
-                return max(price_step, min(px, allowed_max))
-            if side == "sell" and best_bid is not None:
-                allowed_min = best_bid + maker_guard_ticks * tick
-                return max(price_step, max(px, allowed_min))
-            return max(price_step, px)
-
-        # ===== STEP 1: Place new orders FIRST (no liquidity gap) =====
-        new_ids: Set[str] = set()
-        placed_buy = 0
-        placed_sell = 0
-
-        for px, qty in zip(buy_prices, sizes_buy):
-            if placed_buy >= depth:
-                break
-            qty = max(qty, limits["min_amount"])
-            px_adj = guard_price(self.price_to_precision(px), "buy")
-            oid = self.create_limit("buy", px_adj, qty)
-            if oid:
-                new_ids.add(oid)
-                placed_buy += 1
-
-        for px, qty in zip(sell_prices, sizes_sell):
-            if placed_sell >= depth:
-                break
-            qty = max(qty, limits["min_amount"])
-            px_adj = guard_price(self.price_to_precision(px), "sell")
-            oid = self.create_limit("sell", px_adj, qty)
-            if oid:
-                new_ids.add(oid)
-                placed_sell += 1
-
-        logger.info(
-            f"{self.exchange_name} placed ladder | mid={mid:.10f} buys={placed_buy} sells={placed_sell}"
-        )
-
-        # ===== STEP 2: Cancel ONLY stale orders (stealth cleanup) =====
-        try:
-            open_orders = self.fetch_open_orders()
-            open_ids_now = {str(o["id"]) for o in open_orders if o.get("id")}
-
-            # Cancel everything EXCEPT the orders we just placed
-            to_cancel = [oid for oid in open_ids_now if oid not in new_ids]
-
-            if to_cancel:
-                self.cancel_orders_by_ids(to_cancel)
-                logger.info(f"{self.exchange_name} removed {len(to_cancel)} stale orders | remaining={len(new_ids)}")
-        except Exception as e:
-            logger.warning(f"{self.exchange_name} refresh cleanup error: {e}")
-
-        return new_ids
