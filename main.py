@@ -10,7 +10,7 @@ load_dotenv()
 
 from config import EXCHANGES, SETTINGS
 from runner import run_once
-from adapters.ccxt_adapter import CCXTAdapter
+from adapters.bitmart_adapter import BitMartAdapter
 from adapters.biconomy_adapter import BiconomyAdapter
 from adapters.tapbit_adapter import TapbitAdapter
 from adapters.dextrade_adapter import DexTradeAdapter
@@ -38,7 +38,7 @@ signal.signal(signal.SIGTERM, stop)
 
 def build_adapter(cfg):
     adapters = {
-        "bitmart": CCXTAdapter,
+        "bitmart": BitMartAdapter,
         "p2b": P2BAdapter,
         "biconomy": BiconomyAdapter,
         "tapbit": TapbitAdapter,

@@ -1,30 +1,34 @@
-# adapters/biconomy_adapter.py — FIXED for bot compatibility
+# adapters/biconomy_adapter.py — Doc-verified for bot compatibility
 import os
 import time
 import hashlib
 import requests
 import logging
 from typing import Optional, List
-from .base import BaseAdapter
+
+from helpers.batch_cancel import BatchCancelMixin
 
 logger = logging.getLogger(__name__)
+
 BASE = "https://api.biconomy.com"
 
 
-class BiconomyAdapter(BaseAdapter):
+class BiconomyAdapter(BatchCancelMixin):
     def __init__(self, cfg):
-        super().__init__(cfg)
-        self.key = os.getenv("BICONOMY_KEY", "") or getattr(cfg, "api_key_env", "")
-        self.secret = os.getenv("BICONOMY_SECRET", "") or getattr(cfg, "secret_env", "")
+        self.cfg = cfg
+        self.exchange_name = cfg.id
+        self.symbol = cfg.symbol
+        self.btc_symbol = cfg.btc_symbol
+        self.dry_run = cfg.dry_run
 
+        self.key = os.getenv("BICONOMY_KEY", "")
+        self.secret = os.getenv("BICONOMY_SECRET", "")
         self.session = requests.Session()
         self.session.headers.update({
             "X-BB-APIKEY": self.key,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-SITE-ID": "127"
         })
-
-        self._error_cache = {}
 
     def _sign(self, params: dict) -> dict:
         if not self.secret:
@@ -42,25 +46,62 @@ class BiconomyAdapter(BaseAdapter):
         r.raise_for_status()
         return r.json()
 
-    def _smart_log(self, level, key, message):
-        """Log with deduplication"""
-        now = time.time()
-        if key not in self._error_cache:
-            self._error_cache[key] = {"count": 0, "last_time": now}
-        if now - self._error_cache[key]["last_time"] > 60:
-            self._error_cache[key] = {"count": 0, "last_time": now}
-        self._error_cache[key]["count"] += 1
-        self._error_cache[key]["last_time"] = now
-        count = self._error_cache[key]["count"]
-        if count == 1 or count == 10 or count == 50 or count % 100 == 0:
-            suffix = f" (×{count})" if count > 1 else ""
-            getattr(logger, level)(message + suffix)
+    def connect(self):
+        logger.info(f"Connected {self.exchange_name} (Biconomy)")
+
+    def fetch_btc_last(self) -> float:
+        try:
+            r = requests.get(BASE + "/api/v1/tickers", timeout=10).json()
+            for t in r.get("ticker", []):
+                if t.get("symbol") in ("BTC_USDT", "BTCUSDT"):
+                    return float(t["last"])
+        except Exception:
+            pass
+        return 92000.0
+
+    def fetch_best_quotes(self):
+        try:
+            r = requests.get(BASE + "/api/v1/tickers", timeout=10).json()
+            for t in r.get("ticker", []):
+                if t.get("symbol") == self.symbol.replace("/", "_"):
+                    return float(t.get("buy")), float(t.get("sell"))
+        except Exception:
+            pass
+        return None, None
+
+    def fetch_open_orders(self) -> List[dict]:
+        if self.dry_run:
+            return []
+        try:
+            r = self._post("/api/v1/private/order/pending",
+                           {"market": self.symbol, "offset": "0", "limit": "100"})
+            records = r.get("result", {}).get("records", [])
+            return [
+                {"id": str(o.get("id", o.get("order_id")))}
+                for o in records if o.get("id") or o.get("order_id")
+            ]
+        except Exception:
+            return []
+
+    def cancel_orders_by_ids(self, order_ids: List[str]):
+        """Doc-verified batch cancel using orders_json, max 10 per batch"""
+        if self.dry_run or not order_ids:
+            return
+
+        def payload_func(batch):
+            return {
+                "orders_json": [
+                    {"market": self.symbol.replace("/", "_"), "order_id": int(oid)}
+                    for oid in batch
+                ]
+            }
+
+        # Call doc-verified cancel_batch endpoint
+        self._cancel_in_batches(order_ids, "/api/v1/private/trade/cancel_batch", payload_func, batch_size=10)
 
     def create_limit(self, side: str, price: float, amount: float) -> Optional[str]:
         if self.dry_run:
-            logger.info(f"[DRY] {side.upper()} {amount:>8.0f} @ {price:.10f}")
-            return "dry"
-
+            return f"dry_{int(time.time() * 1000000)}"
         payload = {
             "market": self.symbol,
             "side": "2" if side.lower() == "buy" else "1",
@@ -68,122 +109,27 @@ class BiconomyAdapter(BaseAdapter):
             "price": f"{price:.10f}",
             "type": "1"
         }
-
         try:
             resp = self._post("/api/v1/private/order/create", payload)
-            code = resp.get("code", -1)
-            msg = resp.get("msg", "").lower()
-
-            if code == 0:
-                oid = resp.get("result", {}).get("order_id", "unknown")
-                logger.info(f"✓ BICONOMY {side.upper():4s} {amount:>8.0f} @ {price:.10f} [ID:{oid}]")
+            if resp.get("code") == 0:
+                oid = resp.get("result", {}).get("order_id")
+                logger.info(f"{self.exchange_name} {side.upper()} {amount:.0f} @ {price:.10f} id={oid}")
                 return str(oid)
-
-            # Silent failures (normal market making)
-            if any(x in msg for x in ["balance", "insufficient", "price", "accuracy", "amount", "post only"]):
-                return None
-
-            # Log important errors with deduplication
-            if code == 10003 or "ip" in msg or "forbidden" in msg:
-                self._smart_log("warning", "ip_whitelist", f"BICONOMY ERROR: {resp.get('msg', 'IP not whitelisted')}")
-            elif code == 10004:
-                self._smart_log("warning", "api_disabled", f"BICONOMY ERROR: {resp.get('msg', 'API disabled')}")
-
-            return None
-
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 403:
-                self._smart_log("warning", "http_403", "BICONOMY ERROR: HTTP 403 - IP not whitelisted")
-            return None
         except Exception:
-            return None
-
-    def fetch_open_orders(self):
-        """Fetch open orders in standardized format for bot compatibility"""
-        if self.dry_run:
-            return []
-        try:
-            r = self._post("/api/v1/private/order/pending", {
-                "market": self.symbol,
-                "offset": "0",
-                "limit": "100"
-            })
-            records = r.get("result", {}).get("records", [])
-            # Return standardized format: [{"id": "..."}, ...]
-            return [{"id": str(order.get("id", order.get("order_id")))}
-                    for order in records if order.get("id") or order.get("order_id")]
-        except:
-            return []
-
-    def cancel_orders_by_ids(self, ids: List[str]):
-        """Cancel specific orders by ID with proper logging"""
-        if self.dry_run:
-            logger.info(f"[DRY] BICONOMY cancel {len(ids)} orders")
-            return
-
-        if not ids:
-            return
-
-        cancelled = 0
-        for oid in ids:
-            try:
-                resp = self._post("/api/v1/private/order/cancel", {
-                    "market": self.symbol,
-                    "order_id": str(oid)
-                })
-                if resp.get("code") == 0:
-                    cancelled += 1
-            except:
-                pass
-
-        if cancelled > 0:
-            logger.info(f"BICONOMY cancelled {cancelled} stale orders")
-
-    def cancel_all_orders(self):
-        """Cancel all open orders"""
-        if self.dry_run:
-            logger.info(f"[DRY] BICONOMY cancel all")
-            return
-
-        orders = self.fetch_open_orders()
-        if orders:
-            ids = [o["id"] for o in orders]
-            self.cancel_orders_by_ids(ids)
-
-    def connect(self):
-        logger.info("Biconomy adapter ready")
-
-    def fetch_btc_last(self) -> float:
-        try:
-            r = requests.get(f"{BASE}/api/v1/tickers", timeout=10).json()
-            for t in r.get("ticker", []):
-                if t.get("symbol") in ("BTC_USDT", "BTC-USDT", "BTCUSDT"):
-                    return float(t["last"])
-        except:
             pass
-        return 92000.0
+        return None
 
-    def fetch_best_quotes(self):
-        try:
-            r = requests.get(f"{BASE}/api/v1/tickers", timeout=10).json()
-            for t in r.get("ticker", []):
-                if t.get("symbol") in (self.symbol, self.symbol.replace("_", "")):
-                    bid = t.get("buy")
-                    ask = t.get("sell")
-                    if bid and ask:
-                        return float(bid), float(ask)
-        except:
-            pass
-        return None, None
-
-    def price_to_precision(self, p: float) -> float:
+    def price_to_precision(self, p):
         return round(p, 8)
 
-    def amount_to_precision(self, a: float) -> int:
+    def amount_to_precision(self, a):
         return int(round(a))
 
-    def get_limits(self) -> dict:
+    def get_limits(self):
         return {"min_amount": 1, "min_cost": 1.0}
 
-    def get_steps(self) -> tuple:
+    def get_steps(self):
         return 1e-8, 1
+
+    def get_precisions(self):
+        return (8, 0)
