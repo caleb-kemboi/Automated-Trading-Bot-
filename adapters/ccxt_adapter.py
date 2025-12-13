@@ -89,16 +89,35 @@ class CCXTAdapter(BaseAdapter):
         return None
 
     def cancel_orders_by_ids(self, ids: list):
-        if self.dry_run or not ids:
+        """Cancel specific order IDs (used to remove stale orders while keeping fresh ones)"""
+        if self.dry_run:
+            logger.info(f"[DRY] {self.exchange_name} cancel {len(ids)} orders")
             return
-        payload = {
-            "symbol": self.symbol.replace("/", "_"),
-            "order_ids": [str(i) for i in ids[:50]]
-        }
-        try:
-            self._request("POST", "/spot/v2/batch_orders_cancel", data=payload, version="v2")
-        except Exception as e:
-            logger.warning(f"Batch cancel failed: {e}")
+
+        if not ids:
+            return
+
+        # BitMart batch cancel supports up to 50 orders per request
+        symbol = self.symbol.replace("/", "_")
+        cancelled_count = 0
+
+        for i in range(0, len(ids), 50):
+            batch = [str(oid) for oid in ids[i:i + 50]]
+            payload = {
+                "symbol": symbol,
+                "order_ids": batch
+            }
+            try:
+                resp = self._request("POST", "/spot/v2/batch_orders_cancel", data=payload, version="v2")
+                if resp.get("code") in ["1000", 1000]:
+                    cancelled_count += len(batch)
+                else:
+                    logger.warning(f"Batch cancel response: {resp}")
+            except Exception as e:
+                logger.warning(f"Batch cancel failed for {len(batch)} orders: {e}")
+
+        if cancelled_count > 0:
+            logger.info(f"{self.exchange_name} cancelled {cancelled_count} stale orders")
 
     def cancel_all_orders(self):
         """Cancel ALL open orders using v4 cancel_all endpoint"""
@@ -144,22 +163,21 @@ class CCXTAdapter(BaseAdapter):
         return None, None
 
     def fetch_open_orders(self):
-        """Fetch ONLY open/pending orders"""
+        """Fetch ALL open orders (both new and old)"""
         if self.dry_run:
             return []
         try:
             symbol = self.symbol.replace("/", "_")
-            # Use 'pending' to get only open orders, not filled/cancelled
+            # Fetch ALL open/pending orders
             r = self._request("GET", "/spot/v2/orders",
                               params={"symbol": symbol, "orderState": "pending"},
                               version="v2")
 
             orders = r.get("data", {}).get("orders", [])
 
-            # Filter for truly open orders (status 2=pending, 4=partially_filled)
-            open_orders = [o for o in orders if o.get("status") in ["2", "4"]]
-
-            return open_orders
+            # Return all pending orders with their IDs
+            return [{"id": str(o.get("order_id"))} for o in orders
+                    if o.get("order_id") and o.get("status") in ["2", "4"]]
         except Exception as e:
             logger.warning(f"Fetch orders error: {e}")
             return []

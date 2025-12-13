@@ -1,4 +1,4 @@
-# adapters/biconomy_adapter.py — CLEAN LOGGING VERSION
+# adapters/biconomy_adapter.py — FIXED for bot compatibility
 import os
 import time
 import hashlib
@@ -24,7 +24,6 @@ class BiconomyAdapter(BaseAdapter):
             "X-SITE-ID": "127"
         })
 
-        # Error deduplication
         self._error_cache = {}
 
     def _sign(self, params: dict) -> dict:
@@ -44,21 +43,15 @@ class BiconomyAdapter(BaseAdapter):
         return r.json()
 
     def _smart_log(self, level, key, message):
-        """Log with deduplication - only log 1st, 10th, 50th occurrence"""
+        """Log with deduplication"""
         now = time.time()
-
         if key not in self._error_cache:
             self._error_cache[key] = {"count": 0, "last_time": now}
-
-        # Reset if 60s passed
         if now - self._error_cache[key]["last_time"] > 60:
             self._error_cache[key] = {"count": 0, "last_time": now}
-
         self._error_cache[key]["count"] += 1
         self._error_cache[key]["last_time"] = now
         count = self._error_cache[key]["count"]
-
-        # Log at 1, 10, 50, 100, etc
         if count == 1 or count == 10 or count == 50 or count % 100 == 0:
             suffix = f" (×{count})" if count > 1 else ""
             getattr(logger, level)(message + suffix)
@@ -81,56 +74,84 @@ class BiconomyAdapter(BaseAdapter):
             code = resp.get("code", -1)
             msg = resp.get("msg", "").lower()
 
-            # Debug: log first rejection with full details
-            if code != 0 and not hasattr(self, '_logged_rejection'):
-                logger.warning(f"BICONOMY REJECT: {resp}")
-                self._logged_rejection = True
-
-            # SUCCESS
             if code == 0:
                 oid = resp.get("result", {}).get("order_id", "unknown")
                 logger.info(f"✓ BICONOMY {side.upper():4s} {amount:>8.0f} @ {price:.10f} [ID:{oid}]")
                 return str(oid)
 
-            # SILENT ERRORS (expected/normal rejections)
-            if "balance" in msg or "insufficient" in msg or "10062" in str(resp):
-                return None  # Silent - normal market making
-            if "price" in msg or "accuracy" in msg or "10061" in str(resp):
-                return None  # Silent - precision issue
-            if "amount" in msg or "10062" in str(resp):
-                return None  # Silent - amount issue
-            if "post only" in msg or "post_only" in msg:
-                return None  # Silent - crossed spread
+            # Silent failures (normal market making)
+            if any(x in msg for x in ["balance", "insufficient", "price", "accuracy", "amount", "post only"]):
+                return None
 
-            # IMPORTANT ERRORS (log with deduplication and exact error message)
+            # Log important errors with deduplication
             if code == 10003 or "ip" in msg or "forbidden" in msg:
-                error_detail = resp.get('msg', 'IP not whitelisted')
-                self._smart_log("warning", "ip_whitelist", f"BICONOMY ERROR: {error_detail}")
-                return None
-            if code == 10004:
-                error_detail = resp.get('msg', 'API key disabled')
-                self._smart_log("warning", "api_disabled", f"BICONOMY ERROR: {error_detail}")
-                return None
+                self._smart_log("warning", "ip_whitelist", f"BICONOMY ERROR: {resp.get('msg', 'IP not whitelisted')}")
+            elif code == 10004:
+                self._smart_log("warning", "api_disabled", f"BICONOMY ERROR: {resp.get('msg', 'API disabled')}")
 
-            # Generic rejection - silent (likely post-only or price issue)
             return None
 
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 403:
                 self._smart_log("warning", "http_403", "BICONOMY ERROR: HTTP 403 - IP not whitelisted")
-            elif e.response.status_code == 429:
-                self._smart_log("debug", "rate_limit", "BICONOMY ERROR: Rate limited")
-            else:
-                self._smart_log("debug", f"http_{e.response.status_code}",
-                                f"BICONOMY ERROR: HTTP {e.response.status_code}")
             return None
-        except Exception as e:
-            self._smart_log("debug", "network_error", f"BICONOMY ERROR: {type(e).__name__}")
+        except Exception:
             return None
 
-    # ———— Rest unchanged ————
+    def fetch_open_orders(self):
+        """Fetch open orders in standardized format for bot compatibility"""
+        if self.dry_run:
+            return []
+        try:
+            r = self._post("/api/v1/private/order/pending", {
+                "market": self.symbol,
+                "offset": "0",
+                "limit": "100"
+            })
+            records = r.get("result", {}).get("records", [])
+            # Return standardized format: [{"id": "..."}, ...]
+            return [{"id": str(order.get("id", order.get("order_id")))}
+                    for order in records if order.get("id") or order.get("order_id")]
+        except:
+            return []
+
+    def cancel_orders_by_ids(self, ids: List[str]):
+        """Cancel specific orders by ID with proper logging"""
+        if self.dry_run:
+            logger.info(f"[DRY] BICONOMY cancel {len(ids)} orders")
+            return
+
+        if not ids:
+            return
+
+        cancelled = 0
+        for oid in ids:
+            try:
+                resp = self._post("/api/v1/private/order/cancel", {
+                    "market": self.symbol,
+                    "order_id": str(oid)
+                })
+                if resp.get("code") == 0:
+                    cancelled += 1
+            except:
+                pass
+
+        if cancelled > 0:
+            logger.info(f"BICONOMY cancelled {cancelled} stale orders")
+
+    def cancel_all_orders(self):
+        """Cancel all open orders"""
+        if self.dry_run:
+            logger.info(f"[DRY] BICONOMY cancel all")
+            return
+
+        orders = self.fetch_open_orders()
+        if orders:
+            ids = [o["id"] for o in orders]
+            self.cancel_orders_by_ids(ids)
+
     def connect(self):
-        pass  # Silent
+        logger.info("Biconomy adapter ready")
 
     def fetch_btc_last(self) -> float:
         try:
@@ -154,22 +175,6 @@ class BiconomyAdapter(BaseAdapter):
         except:
             pass
         return None, None
-
-    def fetch_open_orders(self):
-        if self.dry_run: return []
-        try:
-            r = self._post("/api/v1/private/order/pending", {"market": self.symbol, "offset": "0", "limit": "100"})
-            return r.get("result", {}).get("records", [])
-        except:
-            return []
-
-    def cancel_orders_by_ids(self, ids: List[str]):
-        if self.dry_run or not ids: return
-        for oid in ids:
-            try:
-                self._post("/api/v1/private/order/cancel", {"market": self.symbol, "order_id": str(oid)})
-            except:
-                pass
 
     def price_to_precision(self, p: float) -> float:
         return round(p, 8)

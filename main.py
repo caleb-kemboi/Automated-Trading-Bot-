@@ -14,6 +14,7 @@ from adapters.ccxt_adapter import CCXTAdapter
 from adapters.biconomy_adapter import BiconomyAdapter
 from adapters.tapbit_adapter import TapbitAdapter
 from adapters.dextrade_adapter import DexTradeAdapter
+from adapters.p2b_adapter import P2BAdapter
 from adapters.backtest_adapter import BacktestAdapter
 
 logging.basicConfig(
@@ -38,7 +39,7 @@ signal.signal(signal.SIGTERM, stop)
 def build_adapter(cfg):
     adapters = {
         "bitmart": CCXTAdapter,
-        "p2b": CCXTAdapter,
+        "p2b": P2BAdapter,
         "biconomy": BiconomyAdapter,
         "tapbit": TapbitAdapter,
         "dextrade": DexTradeAdapter,
