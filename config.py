@@ -75,7 +75,7 @@ EXCHANGES: List[ExchangeConfig] = [
         symbol="OHO/USDT",
         btc_symbol="BTC/USDT",
         enabled=True,
-        dry_run=True,  # Live mode
+        dry_run=False,  # Live mode
         api_key_env="BITMART_KEY",
         secret_env="BITMART_SECRET",
         uid_env="BITMART_UID",  # CRITICAL: Must be set!
@@ -86,7 +86,7 @@ EXCHANGES: List[ExchangeConfig] = [
         symbol="OHO/USDT",
         btc_symbol="BTC/USDT",
         enabled=True,
-        dry_run=True,
+        dry_run=False,
         api_key_env="P2B_KEY",
         secret_env="P2B_SECRET"
     ),
@@ -95,7 +95,7 @@ EXCHANGES: List[ExchangeConfig] = [
         symbol="OHOUSDT",
         btc_symbol="BTCUSDT",
         enabled=True,
-        dry_run=True,
+        dry_run=False,
         api_key_env="DEXTRADE_KEY"
     ),
     ExchangeConfig(
@@ -103,7 +103,7 @@ EXCHANGES: List[ExchangeConfig] = [
         symbol="OHO_USDT",
         btc_symbol="BTC_USDT",
         enabled=True,
-        dry_run=True,
+        dry_run=False,
         api_key_env="BICONOMY_KEY",
         secret_env="BICONOMY_SECRET"
     ),
@@ -112,7 +112,7 @@ EXCHANGES: List[ExchangeConfig] = [
         symbol="OHOUSDT",
         btc_symbol="BTCUSDT",
         enabled=True,
-        dry_run=True,
+        dry_run=False,
         api_key_env="TAPBIT_KEY",
         secret_env="TAPBIT_SECRET"
     ),
