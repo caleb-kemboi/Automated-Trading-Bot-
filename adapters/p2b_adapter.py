@@ -1,4 +1,4 @@
-# adapters/p2b_adapter.py — Updated P2B Exchange Adapter (P2PB2B)
+# adapters/p2b_adapter.py — FULL UPDATED WITH cancel_all_orders
 import os
 import time
 import hmac
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 BASE = "https://api.p2pb2b.com"
 
 
-class P2BAdapter(BatchCancelMixin):
+class P2BAdapter(BatchCancelMixin, BaseAdapter):
     def __init__(self, cfg):
         self.cfg = cfg
         self.exchange_name = cfg.id
@@ -28,103 +28,188 @@ class P2BAdapter(BatchCancelMixin):
         self.secret = os.getenv("P2B_SECRET", "")
         self.session = requests.Session()
 
+    # ---------------- Signing ---------------- #
+
     def _sign_request(self, endpoint: str, payload: dict) -> dict:
-        """Signs the request according to P2B API requirements."""
         payload = payload.copy()
         payload["request"] = endpoint
         payload["nonce"] = str(int(time.time() * 1000))
-        payload_json = json.dumps(payload, separators=(',', ':'))
+
+        payload_json = json.dumps(payload, separators=(",", ":"))
         payload_b64 = base64.b64encode(payload_json.encode()).decode()
-        signature = hmac.new(self.secret.encode(), payload_b64.encode(), hashlib.sha512).hexdigest()
+
+        signature = hmac.new(
+            self.secret.encode(),
+            payload_b64.encode(),
+            hashlib.sha512,
+        ).hexdigest()
+
         return {
             "X-TXC-APIKEY": self.key,
             "X-TXC-PAYLOAD": payload_b64,
             "X-TXC-SIGNATURE": signature,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
 
     def _post(self, endpoint: str, data: dict):
-        headers = self._sign_request(endpoint, data.copy())
-        r = self.session.post(BASE + endpoint, json=data, headers=headers, timeout=10)
+        headers = self._sign_request(endpoint, data)
+        r = self.session.post(
+            BASE + endpoint,
+            json=data,
+            headers=headers,
+            timeout=10,
+        )
         r.raise_for_status()
         return r.json()
 
+    # ---------------- Connection ---------------- #
+
     def connect(self):
-        """No-op for now."""
         pass
 
+    # ---------------- Market Data ---------------- #
+
     def fetch_btc_last(self) -> float:
-        """Fetch last BTC price, with robust handling of ticker JSON structure."""
         try:
-            r = requests.get(BASE + "/api/v2/public/ticker", params={"market": "BTC_USDT"}, timeout=10)
+            r = requests.get(
+                BASE + "/api/v2/public/ticker",
+                params={"market": "BTC_USDT"},
+                timeout=10,
+            )
             data = r.json()
-            if not data.get("success"):
-                raise ValueError("API returned unsuccessful response")
             result = data.get("result") or {}
-            # Support both structures
+
             if "last" in result:
                 return float(result["last"])
-            elif isinstance(result.get("ticker"), dict):
+            if isinstance(result.get("ticker"), dict):
                 return float(result["ticker"].get("last", 92000.0))
+
         except Exception as e:
             logger.warning(f"p2b fetch_btc_last failed: {e}")
+
         return 92000.0
 
     def fetch_best_quotes(self) -> Tuple[Optional[float], Optional[float]]:
-        """Fetch best bid/ask with robust handling of JSON structure."""
         try:
-            r = requests.get(BASE + "/api/v2/public/ticker",
-                             params={"market": self.symbol.replace("/", "_")}, timeout=10)
+            r = requests.get(
+                BASE + "/api/v2/public/ticker",
+                params={"market": self.symbol.replace("/", "_")},
+                timeout=10,
+            )
             data = r.json()
-            if not data.get("success"):
-                raise ValueError("API returned unsuccessful response")
             result = data.get("result") or {}
+
             if "bid" in result and "ask" in result:
                 return float(result["bid"]), float(result["ask"])
-            elif isinstance(result.get("ticker"), dict):
+
+            if isinstance(result.get("ticker"), dict):
                 t = result["ticker"]
                 return float(t.get("bid", 0)), float(t.get("ask", 0))
+
         except Exception as e:
             logger.warning(f"p2b fetch_best_quotes failed: {e}")
+
         return None, None
+
+    # ---------------- Orders ---------------- #
 
     def fetch_open_orders(self) -> List[dict]:
         if self.dry_run:
             return []
+
         try:
-            payload = {"market": self.symbol.replace("/", "_"), "offset": 0, "limit": 100}
+            payload = {
+                "market": self.symbol.replace("/", "_"),
+                "offset": 0,
+                "limit": 100,
+            }
             r = self._post("/api/v2/orders", payload)
+
             if r.get("success"):
-                return [{"id": str(o.get("id"))} for o in r.get("result", {}).get("records", []) if o.get("id")]
+                records = r.get("result", {}).get("records", [])
+                return [{"id": str(o["id"])} for o in records if o.get("id")]
+
         except Exception as e:
             logger.warning(f"p2b fetch_open_orders failed: {e}")
+
         return []
 
     def cancel_orders_by_ids(self, order_ids: List[str]):
-        def payload_func(batch):
-            return [{"market": self.symbol.replace("/", "_"), "orderId": int(oid)} for oid in batch]
+        if self.dry_run or not order_ids:
+            return
 
-        self._cancel_in_batches(order_ids, "/api/v2/order/cancel", payload_func)
+        def payload_func(batch):
+            return [
+                {
+                    "market": self.symbol.replace("/", "_"),
+                    "orderId": int(oid),
+                }
+                for oid in batch
+            ]
+
+        self._cancel_in_batches(
+            order_ids,
+            "/api/v2/order/cancel",
+            payload_func,
+        )
+
+    # ---------------- CRITICAL FIX ---------------- #
+
+    def cancel_all_orders(self):
+        """
+        Cancels ALL open P2B orders.
+        Uses fetch_open_orders + batch cancel endpoint.
+        """
+        if self.dry_run:
+            logger.info(f"[DRY] {self.exchange_name} skip cancel_all_orders()")
+            return
+
+        try:
+            orders = self.fetch_open_orders()
+            if not orders:
+                logger.info(f"{self.exchange_name} no open orders to cancel")
+                return
+
+            order_ids = [o["id"] for o in orders if o.get("id")]
+            if not order_ids:
+                return
+
+            logger.info(f"{self.exchange_name} cancelling {len(order_ids)} open orders")
+            self.cancel_orders_by_ids(order_ids)
+
+        except Exception as e:
+            logger.warning(f"{self.exchange_name} cancel_all_orders failed: {e}")
+
+    # ---------------- Placement ---------------- #
 
     def create_limit(self, side: str, price: float, amount: float) -> Optional[str]:
         if self.dry_run:
-            return f"dry_{int(time.time() * 1000000)}"
+            return f"dry_{int(time.time() * 1_000_000)}"
+
         payload = {
             "market": self.symbol.replace("/", "_"),
             "side": side.lower(),
             "amount": f"{amount:.8f}",
-            "price": f"{price:.10f}"
+            "price": f"{price:.10f}",
         }
+
         try:
             r = self._post("/api/v2/order/new", payload)
             if r.get("success"):
                 oid = r.get("result", {}).get("orderId")
                 if oid:
-                    logger.info(f"{self.exchange_name} {side.upper()} {amount:.0f} @ {price:.10f} id={oid}")
+                    logger.info(
+                        f"{self.exchange_name} {side.upper()} "
+                        f"{amount:.0f} @ {price:.10f} id={oid}"
+                    )
                     return str(oid)
+
         except Exception as e:
             logger.warning(f"p2b create_limit failed: {e}")
+
         return None
+
+    # ---------------- Precision ---------------- #
 
     def price_to_precision(self, p):
         return round(p, 8)
@@ -133,10 +218,10 @@ class P2BAdapter(BatchCancelMixin):
         return round(a, 8)
 
     def get_limits(self):
-        return {"min_amount": 0.00000001, "min_cost": 1.0}
+        return {"min_amount": 1e-8, "min_cost": 1.0}
 
     def get_steps(self):
         return 1e-8, 1e-8
 
     def get_precisions(self):
-        return (8, 8)
+        return 8, 8
