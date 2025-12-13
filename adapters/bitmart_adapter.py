@@ -1,11 +1,9 @@
-import os, time, hmac, hashlib, requests, json, logging
-import uuid
-from typing import Optional, List, Dict, Tuple
+import os, time, hmac, hashlib, requests, json, logging, math, random
+from typing import Optional, List, Dict, Tuple, Set
 
 from helpers.batch_cancel import BatchCancelMixin
 
 logger = logging.getLogger(__name__)
-
 
 class BitMartAdapter(BatchCancelMixin):
     def __init__(self, cfg):
@@ -54,6 +52,7 @@ class BitMartAdapter(BatchCancelMixin):
         r.raise_for_status()
         return r.json()
 
+    # ---------------- Basic market data ---------------- #
     def connect(self):
         logger.info(f"Connected {self.exchange_name} (BitMart)")
 
@@ -74,17 +73,14 @@ class BitMartAdapter(BatchCancelMixin):
         symbol = self.symbol.replace("/", "_")
         r = self._request("GET", "/spot/v2/orders", params={"symbol": symbol, "orderState": "pending"}, version="v2")
         orders = r.get("data", {}).get("orders", [])
-        return [
-            {"id": str(o["order_id"])}
-            for o in orders
-            if o.get("order_id") and o.get("status") in ["new", "partially_filled"]
-        ]
+        return [{"id": str(o["order_id"])} for o in orders if o.get("order_id") and o.get("status") in ["new", "partially_filled"]]
+
     def cancel_orders_by_ids(self, order_ids: List[str]):
         def payload_func(batch):
             return {"symbol": self.symbol.replace("/", "_"), "order_ids": batch}
-
         self._cancel_in_batches(order_ids, "/spot/v2/batch_orders_cancel", payload_func)
 
+    # ---------------- Order placement ---------------- #
     def create_limit(self, side: str, price: float, amount: float) -> Optional[str]:
         price_str = f"{price:.8f}".rstrip("0").rstrip(".")
         amount_str = str(int(round(amount)))
@@ -105,17 +101,70 @@ class BitMartAdapter(BatchCancelMixin):
             return str(oid)
         return None
 
-    def price_to_precision(self, p):
-        return round(p, 8)
+    # ---------------- Precision & Limits ---------------- #
+    def price_to_precision(self, p): return round(p, 8)
+    def amount_to_precision(self, a): return int(round(a))
+    def get_limits(self): return {"min_amount": 1000, "min_cost": 1.0}
+    def get_steps(self): return 1e-8, 1
+    def get_precisions(self): return 8, 0
 
-    def amount_to_precision(self, a):
-        return int(round(a))
+    # ---------------- New: refresh orders (place ladder + cancel stale) ---------------- #
+    def refresh_orders(self, mid: float, depth: int = 20, gap_min: float = 0.000001, gap_max: float = 0.000002,
+                       size_min: float = 4200, size_max: float = 6000, min_spread_bps: float = 5.0,
+                       maker_guard_ticks: int = 2) -> Set[str]:
+        """Place new ladder orders and cancel only stale orders."""
+        limits = self.get_limits()
+        best_bid, best_ask = self.fetch_best_quotes()
+        price_step, amount_step = self.get_steps()
+        tick = price_step
 
-    def get_limits(self):
-        return {"min_amount": 1000, "min_cost": 1.0}
+        # Build ladders
+        def build_ladder(mid_val, side):
+            levels = []
+            acc = 0.0
+            for _ in range(depth):
+                step = random.uniform(gap_min, gap_max)
+                acc += step
+                levels.append(mid_val - acc if side == "buy" else mid_val + acc)
+            return levels
 
-    def get_steps(self):
-        return 1e-8, 1
+        buy_prices = build_ladder(mid, "buy")
+        sell_prices = build_ladder(mid, "sell")
+        sizes_buy = [random.uniform(size_min, size_max) for _ in range(depth)]
+        sizes_sell = [random.uniform(size_min, size_max) for _ in range(depth)]
 
-    def get_precisions(self):
-        return (8, 0)
+        # Guard nearest levels
+        def guard_price(px, side):
+            if side == "buy" and best_ask is not None:
+                allowed_max = best_ask - maker_guard_ticks * tick
+                return max(price_step, min(px, allowed_max))
+            if side == "sell" and best_bid is not None:
+                allowed_min = best_bid + maker_guard_ticks * tick
+                return max(price_step, max(px, allowed_min))
+            return max(price_step, px)
+
+        # Step 1: Place new orders
+        new_ids: Set[str] = set()
+        for px, qty in zip(buy_prices, sizes_buy):
+            qty = max(qty, limits["min_amount"])
+            px_adj = guard_price(self.price_to_precision(px), "buy")
+            oid = self.create_limit("buy", px_adj, qty)
+            if oid: new_ids.add(oid)
+        for px, qty in zip(sell_prices, sizes_sell):
+            qty = max(qty, limits["min_amount"])
+            px_adj = guard_price(self.price_to_precision(px), "sell")
+            oid = self.create_limit("sell", px_adj, qty)
+            if oid: new_ids.add(oid)
+
+        # Step 2: Cancel stale orders
+        try:
+            open_orders = self.fetch_open_orders()
+            open_ids_now = {str(o["id"]) for o in open_orders if o.get("id")}
+            to_cancel = [oid for oid in open_ids_now if oid not in new_ids]
+            if to_cancel:
+                self.cancel_orders_by_ids(to_cancel)
+                logger.info(f"{self.exchange_name} stale orders removed: {len(to_cancel)}")
+        except Exception as e:
+            logger.warning(f"{self.exchange_name} refresh cleanup error: {e}")
+
+        return new_ids
